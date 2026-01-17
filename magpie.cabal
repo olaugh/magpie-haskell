@@ -1,0 +1,157 @@
+cabal-version: 2.4
+name:          magpie
+version:       0.1.0.0
+synopsis:      Scrabble engine in Haskell, ported from MAGPIE
+license:       MIT
+author:        Ported from MAGPIE (domino14/magpie)
+
+library
+  exposed-modules:
+    Magpie
+    Magpie.Types
+    Magpie.LetterDistribution
+    Magpie.KWG
+    Magpie.Board
+    Magpie.MoveGen
+    Magpie.Game
+    Magpie.Equity
+    Magpie.KLV
+    Magpie.LeaveMap
+    Magpie.Autoplay
+    Magpie.Shadow
+  hs-source-dirs: src
+  build-depends:
+    base >= 4.14 && < 5,
+    bytestring >= 0.10,
+    containers >= 0.6,
+    vector >= 0.12,
+    random >= 1.2,
+    stm >= 2.5,
+    time >= 1.9
+  default-language: Haskell2010
+  ghc-options: -O2 -Wall
+
+executable magpie
+  main-is: Main.hs
+  hs-source-dirs: app
+  build-depends:
+    base >= 4.14 && < 5,
+    magpie,
+    random >= 1.2
+  default-language: Haskell2010
+  ghc-options: -O2 -threaded -rtsopts "-with-rtsopts=-N"
+
+-- Keep the old anagram executable for backward compatibility
+executable anagram
+  main-is: Main.hs
+  other-modules: KWG, Anagram
+  build-depends:
+    base >= 4.14 && < 5,
+    bytestring >= 0.10,
+    containers >= 0.6,
+    vector >= 0.12
+  default-language: Haskell2010
+  ghc-options: -O2
+
+test-suite movegen-test
+  type: exitcode-stdio-1.0
+  main-is: MoveGenTest.hs
+  hs-source-dirs: test
+  build-depends:
+    base >= 4.14 && < 5,
+    magpie
+  default-language: Haskell2010
+  ghc-options: -O2
+
+test-suite crossset-test
+  type: exitcode-stdio-1.0
+  main-is: CrossSetTest.hs
+  hs-source-dirs: test
+  build-depends:
+    base >= 4.14 && < 5,
+    magpie
+  default-language: Haskell2010
+  ghc-options: -O2
+
+test-suite debug-cgp
+  type: exitcode-stdio-1.0
+  main-is: DebugCGP.hs
+  hs-source-dirs: test
+  build-depends:
+    base >= 4.14 && < 5,
+    magpie
+  default-language: Haskell2010
+  ghc-options: -O2
+
+test-suite equity-test
+  type: exitcode-stdio-1.0
+  main-is: EquityTest.hs
+  hs-source-dirs: test
+  build-depends:
+    base >= 4.14 && < 5,
+    magpie,
+    vector >= 0.12,
+    directory >= 1.3
+  default-language: Haskell2010
+  ghc-options: -O2
+
+test-suite shadow-test
+  type: exitcode-stdio-1.0
+  main-is: ShadowTest.hs
+  hs-source-dirs: test
+  build-depends:
+    base >= 4.14 && < 5,
+    magpie
+  default-language: Haskell2010
+  ghc-options: -O2
+
+test-suite shadow-movegen-test
+  type: exitcode-stdio-1.0
+  main-is: ShadowMoveGenTest.hs
+  hs-source-dirs: test
+  build-depends:
+    base >= 4.14 && < 5,
+    magpie
+  default-language: Haskell2010
+  ghc-options: -O2
+
+test-suite klv-values-test
+  type: exitcode-stdio-1.0
+  main-is: TestKLVValues.hs
+  hs-source-dirs: test
+  build-depends:
+    base >= 4.14 && < 5,
+    magpie
+  default-language: Haskell2010
+  ghc-options: -O2
+
+test-suite debug-equity
+  type: exitcode-stdio-1.0
+  main-is: DebugEquity.hs
+  hs-source-dirs: test
+  build-depends:
+    base >= 4.14 && < 5,
+    magpie
+  default-language: Haskell2010
+  ghc-options: -O2
+
+test-suite debug-klv
+  type: exitcode-stdio-1.0
+  main-is: DebugKLV.hs
+  hs-source-dirs: test
+  build-depends:
+    base >= 4.14 && < 5,
+    magpie,
+    vector >= 0.12
+  default-language: Haskell2010
+  ghc-options: -O2
+
+test-suite debug-exchange
+  type: exitcode-stdio-1.0
+  main-is: DebugExchange.hs
+  hs-source-dirs: test
+  build-depends:
+    base >= 4.14 && < 5,
+    magpie
+  default-language: Haskell2010
+  ghc-options: -O2
