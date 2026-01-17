@@ -7,8 +7,8 @@ import Magpie.Types
 
 main :: IO ()
 main = do
-  ld <- loadLetterDistribution "/Users/olaugh/sources/jan14-magpie/MAGPIE/data/letterdistributions/english.csv"
-  kwg <- loadKWG "/Users/olaugh/sources/jan14-magpie/MAGPIE/data/lexica/NWL20.kwg"
+  ld <- loadLetterDistribution "data/letterdistributions/english.csv"
+  kwg <- loadKWG "data/lexica/NWL20.kwg"
 
   -- Simple test first: row 4 with " A"
   putStrLn "=== Simple test: ' A' at row 4 ==="

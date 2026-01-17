@@ -111,7 +111,7 @@ testKLVLoad = do
   putStrLn "  Testing KLV loading..."
 
   -- Try to load the CSW21 KLV (leave values)
-  let klvPath = "/Users/olaugh/sources/jan14-magpie/MAGPIE/data/lexica/CSW21.klv"
+  let klvPath = "data/lexica/CSW21.klv2"
   exists <- doesFileExist klvPath
   if not exists
     then do
@@ -137,7 +137,7 @@ testKLVLeaveValues :: IO ()
 testKLVLeaveValues = do
   putStrLn "  Testing KLV leave value lookup..."
 
-  let klvPath = "/Users/olaugh/sources/jan14-magpie/MAGPIE/data/lexica/CSW21.klv"
+  let klvPath = "data/lexica/CSW21.klv2"
   exists <- doesFileExist klvPath
   if not exists
     then putStrLn "    Skipping (no KLV file)"

@@ -25,9 +25,9 @@ data TestConfig = TestConfig
 -- | Load test configuration for a lexicon
 loadTestConfig :: String -> IO TestConfig
 loadTestConfig lexName = do
-  let kwgPath = "/Users/olaugh/sources/jan14-magpie/MAGPIE/data/lexica/" ++ lexName ++ ".kwg"
+  let kwgPath = "data/lexica/" ++ lexName ++ ".kwg"
   kwg <- loadKWG kwgPath
-  ld <- loadLetterDistribution "/Users/olaugh/sources/jan14-magpie/MAGPIE/data/letterdistributions/english.csv"
+  ld <- loadLetterDistribution "data/letterdistributions/english.csv"
   return $ TestConfig kwg ld lexName
 
 -- | Count scoring (tile placement) moves
