@@ -340,7 +340,7 @@ autoplay initialGame initialGen verbose = go initialGame initialGen 0 []
               allMoves = generateMoves kwg ld board rack
               bestMove = case allMoves of
                            (m:_) -> m
-                           [] -> Move Pass 0 0 Horizontal [] 0 0 0
+                           [] -> Move Pass 0 0 Horizontal [] 0 0 (Equity 0)
 
           when verbose $ do
             putStrLn $ showGame game

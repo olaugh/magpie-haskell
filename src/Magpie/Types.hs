@@ -45,14 +45,17 @@ module Magpie.Types
   , Move(..)
   , MoveType(..)
 
+    -- * Equity (re-exported from Magpie.Equity)
+  , Equity(..)
+
     -- * Board dimensions
   , boardDim
   , defaultRackSize
   ) where
 
 import Data.Word (Word8, Word64)
-import Data.Int (Int32)
 import Data.Bits ((.&.), (.|.), testBit)
+import Magpie.Equity (Equity(..))
 import qualified Data.Vector.Unboxed as VU
 import GHC.Generics (Generic)
 
@@ -235,5 +238,5 @@ data Move = Move
   , moveTiles      :: ![MachineLetter]  -- ^ Tiles played (0 = play-through)
   , moveTilesUsed  :: !Int              -- ^ Number of tiles from rack
   , moveScore      :: !Int
-  , moveEquity     :: !Int32            -- ^ Score + leave value (fixed-point, 1000x resolution)
+  , moveEquity     :: !Equity           -- ^ Score + leave value
   } deriving (Eq, Show, Generic)
