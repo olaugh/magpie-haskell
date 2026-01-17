@@ -51,6 +51,7 @@ module Magpie.Types
   ) where
 
 import Data.Word (Word8, Word64)
+import Data.Int (Int32)
 import Data.Bits ((.&.), (.|.), testBit)
 import qualified Data.Vector.Unboxed as VU
 import GHC.Generics (Generic)
@@ -234,5 +235,5 @@ data Move = Move
   , moveTiles      :: ![MachineLetter]  -- ^ Tiles played (0 = play-through)
   , moveTilesUsed  :: !Int              -- ^ Number of tiles from rack
   , moveScore      :: !Int
-  , moveEquity     :: !Double           -- ^ Score + leave value
+  , moveEquity     :: !Int32            -- ^ Score + leave value (fixed-point, 1000x resolution)
   } deriving (Eq, Show, Generic)

@@ -23,6 +23,7 @@ import Magpie.LetterDistribution
 import Magpie.Shadow (generateAnchors, Anchor(..), ShadowConfig(..), defaultShadowConfig)
 
 import Data.Word (Word32, Word64)
+import Data.Int (Int32)
 import Data.Bits (testBit, setBit, (.&.))
 import Data.List (sortBy)
 import Data.Ord (comparing, Down(..))
@@ -126,7 +127,8 @@ generateBestMove cfg mKlv kwg ld board rack bagCount =
       passMove = Move Pass 0 0 Horizontal [] 0 0 0
 
       -- Compute equity for a move using leave values
-      computeEquity :: Move -> Double
+      -- Returns fixed-point Int32 with 1000x resolution (same as LeaveValue)
+      computeEquity :: Move -> Int32
       computeEquity m =
         let score = moveScore m
             tiles = moveTiles m
@@ -134,8 +136,9 @@ generateBestMove cfg mKlv kwg ld board rack bagCount =
             leaveVal = case mKlv of
               Just klv -> klvGetLeaveValue klv leave
               Nothing  -> 0
-            -- LeaveValue is fixed-point Int32 (1000x resolution)
-        in fromIntegral score + fromIntegral leaveVal / 1000.0
+            -- Score is in points, LeaveValue is fixed-point (1000x resolution)
+            -- Convert score to same resolution: score * 1000 + leaveVal
+        in fromIntegral score * 1000 + leaveVal
 
       -- Update a move with computed equity
       withEquity :: Move -> Move
@@ -144,17 +147,19 @@ generateBestMove cfg mKlv kwg ld board rack bagCount =
       -- Maximum possible leave value for any rack subset (conservative upper bound)
       -- This is needed because shadow bounds don't include leave values
       -- Raw KLV values range from about -42 to +75 points
-      maxLeaveValue :: Double
+      -- In fixed-point (1000x): 75 * 1000 = 75000
+      maxLeaveValue :: Int32
       maxLeaveValue = case mKlv of
         Nothing -> 0
-        Just _  -> 75.0  -- Conservative upper bound (max KLV value)
+        Just _  -> 75000  -- Conservative upper bound (max KLV value in 1000x resolution)
 
-      processAnchorsWithPruning :: Move -> Double -> [Anchor] -> Move
+      processAnchorsWithPruning :: Move -> Int32 -> [Anchor] -> Move
       processAnchorsWithPruning best bestEquity [] = best
       processAnchorsWithPruning best bestEquity (anchor:rest)
         -- Pruning: if this anchor's upper bound + max leave can't beat our best equity, we're done
         -- We need to add maxLeaveValue because shadow doesn't compute leave bounds
-        | fromIntegral (anchorHighestPossibleScore anchor) + maxLeaveValue <= bestEquity = best
+        -- Anchor score is in points, convert to 1000x resolution for comparison
+        | fromIntegral (anchorHighestPossibleScore anchor) * 1000 + maxLeaveValue <= bestEquity = best
         | otherwise =
             let -- Generate moves at this anchor
                 dir = anchorDir anchor
@@ -564,7 +569,7 @@ buildMove cfg _board row leftstrip rightstrip mainScore wordMult crossScore tile
      , moveTiles = tiles
      , moveTilesUsed = tilesUsed
      , moveScore = totalScore
-     , moveEquity = fromIntegral totalScore
+     , moveEquity = fromIntegral totalScore * 1000  -- Fixed-point, 1000x resolution
      }
 
 -- | Check if rack is empty
