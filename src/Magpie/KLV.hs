@@ -17,11 +17,13 @@ module Magpie.KLV
   , LeaveValue
   , loadKLV
   , klvGetLeaveValue
+  , klvGetLeaveValueFromTiles
   , klvGetWordIndex
   , klvUnfoundIndex
   ) where
 
-import Magpie.Types (MachineLetter(..), Rack(..))
+import Magpie.Types (MachineLetter(..), Rack(..), isBlank)
+import Control.Monad (forM_)
 
 import qualified Data.ByteString as BS
 import Data.Word (Word32, Word8)
@@ -189,6 +191,35 @@ klvGetLeaveValue klv rack
       in if idx == klvUnfoundIndex
          then 0
          else klvLeaveValues klv VU.! fromIntegral idx
+
+-- | Get leave value directly from original rack and tiles played
+-- This avoids allocating intermediate Rack structures
+{-# INLINE klvGetLeaveValueFromTiles #-}
+klvGetLeaveValueFromTiles :: KLV -> Rack -> [MachineLetter] -> LeaveValue
+klvGetLeaveValueFromTiles klv originalRack tilesPlayed
+  | leaveTotal == 0 = 0
+  | otherwise = runST $ do
+      -- Copy original rack counts to mutable vector
+      leaveCounts <- VU.thaw (rackCounts originalRack)
+      -- Remove played tiles
+      forM_ tilesPlayed $ \ml -> do
+        let idx = if isBlank ml
+                  then 0  -- Blanked letters use blank from rack
+                  else fromIntegral (unML ml)
+        MVU.unsafeModify leaveCounts (subtract 1) idx
+      -- Freeze and look up
+      finalCounts <- VU.unsafeFreeze leaveCounts
+      let leaveRack = Rack
+            { rackCounts = finalCounts
+            , rackDistSize = rackDistSize originalRack
+            , rackTotal_ = leaveTotal
+            }
+          idx = klvGetWordIndexInternal klv leaveRack (klvDawgRoot klv)
+      return $ if idx == klvUnfoundIndex
+               then 0
+               else klvLeaveValues klv VU.! fromIntegral idx
+  where
+    leaveTotal = rackTotal_ originalRack - length tilesPlayed
 
 -- | Check if rack is empty
 rackIsEmpty :: Rack -> Bool

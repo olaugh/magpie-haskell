@@ -12,8 +12,8 @@ module Magpie.Autoplay
 import Magpie.Types
 import Magpie.LetterDistribution
 import Magpie.KWG
-import Magpie.KLV (KLV, loadKLV)
-import Magpie.MoveGen (generateBestMove, generateMoves, defaultMoveGenConfig)
+import Magpie.KLV (KLV)
+import Magpie.MoveGen (generateBestMove, defaultMoveGenConfig)
 import Magpie.Game
 
 import Control.Concurrent

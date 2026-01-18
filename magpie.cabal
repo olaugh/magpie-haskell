@@ -155,3 +155,4 @@ test-suite debug-exchange
     magpie
   default-language: Haskell2010
   ghc-options: -O2
+
