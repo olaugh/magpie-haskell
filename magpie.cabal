@@ -21,6 +21,7 @@ library
     Magpie.Shadow
     Magpie.BitRack
     Magpie.WMP
+    Magpie.WMPMoveGen
   hs-source-dirs: src
   build-depends:
     base >= 4.14 && < 5,
@@ -162,6 +163,18 @@ test-suite debug-exchange
 test-suite wmp-test
   type: exitcode-stdio-1.0
   main-is: WMPTest.hs
+  hs-source-dirs: test
+  build-depends:
+    base >= 4.14 && < 5,
+    magpie,
+    directory >= 1.3,
+    vector >= 0.12
+  default-language: Haskell2010
+  ghc-options: -O2
+
+test-suite wmp-movegen-test
+  type: exitcode-stdio-1.0
+  main-is: WMPMoveGenTest.hs
   hs-source-dirs: test
   build-depends:
     base >= 4.14 && < 5,
