@@ -40,20 +40,24 @@ data LetterDistribution = LetterDistribution
   } deriving (Show)
 
 -- | Get the distribution size (number of letter types)
+{-# INLINE ldSize #-}
 ldSize :: LetterDistribution -> Int
 ldSize = ldSize_
 
 -- | Get the score for a machine letter
+{-# INLINE ldScore #-}
 ldScore :: LetterDistribution -> MachineLetter -> Int
-ldScore ld (MachineLetter ml) = ldScores ld VU.! fromIntegral (ml .&. 0x7F)
+ldScore ld (MachineLetter ml) = ldScores ld `VU.unsafeIndex` fromIntegral (ml .&. 0x7F)
 
 -- | Get the count in bag for a machine letter
+{-# INLINE ldCount #-}
 ldCount :: LetterDistribution -> MachineLetter -> Int
-ldCount ld (MachineLetter ml) = ldCounts ld VU.! fromIntegral ml
+ldCount ld (MachineLetter ml) = ldCounts ld `VU.unsafeIndex` fromIntegral ml
 
 -- | Check if a machine letter is a vowel
+{-# INLINE ldIsVowel #-}
 ldIsVowel :: LetterDistribution -> MachineLetter -> Bool
-ldIsVowel ld (MachineLetter ml) = ldIsVowels ld VU.! fromIntegral (ml .&. 0x7F)
+ldIsVowel ld (MachineLetter ml) = ldIsVowels ld `VU.unsafeIndex` fromIntegral (ml .&. 0x7F)
 
 -- | Get total tiles in the distribution
 ldTotalTiles :: LetterDistribution -> Int

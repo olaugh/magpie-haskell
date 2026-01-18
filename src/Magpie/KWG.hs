@@ -65,9 +65,10 @@ bytesToWord32s (a:b:c:d:rest) =
 bytesToWord32s _ = []
 
 -- | Get a node by index
+{-# INLINE getNode #-}
 getNode :: KWG -> Word32 -> Word32
 getNode (KWG nodes) idx
-  | fromIntegral idx < V.length nodes = nodes V.! fromIntegral idx
+  | fromIntegral idx < V.length nodes = nodes `V.unsafeIndex` fromIntegral idx
   | otherwise = 0
 
 -- | Number of nodes
@@ -75,31 +76,38 @@ numNodes :: KWG -> Int
 numNodes (KWG nodes) = V.length nodes
 
 -- | Get the DAWG root node index (from node 0)
+{-# INLINE dawgRoot #-}
 dawgRoot :: KWG -> Word32
 dawgRoot kwg = nodeArcIndex (getNode kwg 0)
 
 -- | Get the GADDAG root node index (from node 1)
+{-# INLINE gaddagRoot #-}
 gaddagRoot :: KWG -> Word32
 gaddagRoot kwg = nodeArcIndex (getNode kwg 1)
 
 -- | Extract the arc index (pointer to children) from a node
+{-# INLINE nodeArcIndex #-}
 nodeArcIndex :: Word32 -> Word32
 nodeArcIndex node = node .&. 0x3FFFFF
 
 -- | Extract the tile/letter from a node
+{-# INLINE nodeTile #-}
 nodeTile :: Word32 -> Word32
 nodeTile node = node `shiftR` 24
 
 -- | Check if this is the last sibling in a node set
+{-# INLINE nodeIsEnd #-}
 nodeIsEnd :: Word32 -> Bool
 nodeIsEnd node = testBit node 22
 
 -- | Check if this node accepts (completes a valid word)
+{-# INLINE nodeAccepts #-}
 nodeAccepts :: Word32 -> Bool
 nodeAccepts node = testBit node 23
 
 -- | Get the next node index for a given letter
 -- Returns 0 if the letter is not found
+{-# INLINE getNextNodeIndex #-}
 getNextNodeIndex :: KWG -> Word32 -> MachineLetter -> Word32
 getNextNodeIndex kwg nodeIdx (MachineLetter letter)
   | nodeIdx == 0 = 0

@@ -8,6 +8,7 @@ module Magpie.Board
   , getLetter
   , setLetter
   , getSquare
+  , setSquare
   , isEmpty
   , isOnBoard
 
@@ -52,15 +53,21 @@ import Data.Bits (setBit, testBit)
 import Control.Monad (forM_)
 import Control.Monad.ST (runST)
 
--- | The game board
+-- | The game board - flat vector with manual indexing for performance
+-- Uses row * boardDim + col indexing (row-major order)
 data Board = Board
-  { boardSquares :: !(V.Vector (V.Vector Square))
+  { boardSquares :: !(V.Vector Square)  -- Flat vector of 225 squares
   , boardDim_    :: !Int
   } deriving (Show)
 
--- | Standard 15x15 Scrabble board layout
-standardBonuses :: V.Vector (V.Vector BonusSquare)
-standardBonuses = V.fromList $ map V.fromList
+-- | Convert (row, col) to flat index
+{-# INLINE boardIndex #-}
+boardIndex :: Int -> Int -> Int -> Int
+boardIndex dim row col = row * dim + col
+
+-- | Standard 15x15 Scrabble board layout (flat vector, row-major)
+standardBonuses :: V.Vector BonusSquare
+standardBonuses = V.fromList $ concat
   [ [tw, ns, ns, dl, ns, ns, ns, tw, ns, ns, ns, dl, ns, ns, tw]
   , [ns, dw, ns, ns, ns, tl, ns, ns, ns, tl, ns, ns, ns, dw, ns]
   , [ns, ns, dw, ns, ns, ns, dl, ns, dl, ns, ns, ns, dw, ns, ns]
@@ -91,41 +98,57 @@ emptyBoard = standardBoard
 -- | Create a standard 15x15 board
 standardBoard :: Board
 standardBoard = Board
-  { boardSquares = V.generate boardDim $ \r ->
-      V.generate boardDim $ \c ->
-        emptySquare { sqBonus = standardBonuses V.! r V.! c }
+  { boardSquares = V.generate (boardDim * boardDim) $ \i ->
+      let r = i `div` boardDim
+          c = i `mod` boardDim
+      in emptySquare { sqBonus = standardBonuses V.! i }
   , boardDim_ = boardDim
   }
 
 -- | Check if position is on board
+{-# INLINE isOnBoard #-}
 isOnBoard :: Board -> Row -> Col -> Bool
 isOnBoard board r c =
   r >= 0 && r < boardDim_ board && c >= 0 && c < boardDim_ board
 
 -- | Get the letter at a position
+{-# INLINE getLetter #-}
 getLetter :: Board -> Row -> Col -> MachineLetter
 getLetter board r c
-  | isOnBoard board r c = sqLetter (boardSquares board V.! r V.! c)
+  | isOnBoard board r c = sqLetter (boardSquares board V.! boardIndex (boardDim_ board) r c)
   | otherwise = MachineLetter 0
 
 -- | Set the letter at a position
+{-# INLINE setLetter #-}
 setLetter :: Board -> Row -> Col -> MachineLetter -> Board
 setLetter board r c ml
   | isOnBoard board r c =
-      let row = boardSquares board V.! r
-          sq = row V.! c
+      let dim = boardDim_ board
+          idx = boardIndex dim r c
+          sq = boardSquares board V.! idx
           sq' = sq { sqLetter = ml }
-          row' = row V.// [(c, sq')]
-      in board { boardSquares = boardSquares board V.// [(r, row')] }
+      in board { boardSquares = boardSquares board V.// [(idx, sq')] }
+  | otherwise = board
+
+-- | Set a square at a position
+{-# INLINE setSquare #-}
+setSquare :: Board -> Row -> Col -> Square -> Board
+setSquare board r c sq
+  | isOnBoard board r c =
+      let dim = boardDim_ board
+          idx = boardIndex dim r c
+      in board { boardSquares = boardSquares board V.// [(idx, sq)] }
   | otherwise = board
 
 -- | Get the full square at a position
+{-# INLINE getSquare #-}
 getSquare :: Board -> Row -> Col -> Square
 getSquare board r c
-  | isOnBoard board r c = boardSquares board V.! r V.! c
+  | isOnBoard board r c = boardSquares board V.! boardIndex (boardDim_ board) r c
   | otherwise = emptySquare
 
 -- | Check if a square is empty
+{-# INLINE isEmpty #-}
 isEmpty :: Board -> Row -> Col -> Bool
 isEmpty board r c = unML (getLetter board r c) == 0
 
@@ -135,14 +158,15 @@ isEmpty board r c = unML (getLetter board r c) == 0
 -- Also computes extension sets for shadow algorithm
 computeCrossSets :: KWG -> LetterDistribution -> Direction -> Board -> Board
 computeCrossSets kwg ld dir board = runST $ do
-  -- Create mutable copy
-  rows <- V.thaw (boardSquares board)
+  -- Create mutable copy of flat vector
+  squares <- V.thaw (boardSquares board)
+  let dim = boardDim_ board
 
   -- Iterate over all (row, col) positions
-  forM_ [0 .. boardDim_ board - 1] $ \r -> do
-    row <- V.thaw =<< MV.read rows r
-    forM_ [0 .. boardDim_ board - 1] $ \c -> do
-      sq <- MV.read row c
+  forM_ [0 .. dim - 1] $ \r -> do
+    forM_ [0 .. dim - 1] $ \c -> do
+      let idx = boardIndex dim r c
+      sq <- MV.read squares idx
 
       if unML (sqLetter sq) /= 0
         then return ()  -- Square is occupied, no cross-set needed
@@ -150,18 +174,15 @@ computeCrossSets kwg ld dir board = runST $ do
           -- Find tiles in cross direction and compute valid letters + extension sets
           let (crossSet, crossScore, leftExt, rightExt) =
                 computeCrossSetAndExtensions kwg ld board dir r c
-          MV.write row c $ sq
+          MV.write squares idx $ sq
             { sqCrossSet = crossSet
             , sqCrossScore = crossScore
             , sqLeftExtensionSet = leftExt
             , sqRightExtensionSet = rightExt
             }
 
-    row' <- V.freeze row
-    MV.write rows r row'
-
-  rows' <- V.freeze rows
-  return board { boardSquares = rows' }
+  squares' <- V.freeze squares
+  return board { boardSquares = squares' }
 
 -- | Compute cross-set and extension sets for a single square
 -- Returns (crossSet, crossScore, leftExtensionSet, rightExtensionSet)
@@ -378,8 +399,7 @@ letterInCrossSet crossSet (MachineLetter ml) = testBit crossSet (fromIntegral ml
 -- An anchor is an empty square adjacent to a filled square
 computeAnchors :: Board -> Board
 computeAnchors board = runST $ do
-  rows <- V.thaw (boardSquares board)
-
+  squares <- V.thaw (boardSquares board)
   let dim = boardDim_ board
 
   -- Check if center is empty (first move)
@@ -388,20 +408,18 @@ computeAnchors board = runST $ do
       centerEmpty = isEmpty board centerR centerC
 
   forM_ [0 .. dim - 1] $ \r -> do
-    row <- V.thaw =<< MV.read rows r
     forM_ [0 .. dim - 1] $ \c -> do
-      sq <- MV.read row c
+      let idx = boardIndex dim r c
+      sq <- MV.read squares idx
       let isAnch = if unML (sqLetter sq) /= 0
                    then False
                    else if centerEmpty && r == centerR && c == centerC
                         then True  -- Center is anchor for first move
                         else hasAdjacentTile board r c
-      MV.write row c $ sq { sqIsAnchor = isAnch }
-    row' <- V.freeze row
-    MV.write rows r row'
+      MV.write squares idx $ sq { sqIsAnchor = isAnch }
 
-  rows' <- V.freeze rows
-  return board { boardSquares = rows' }
+  squares' <- V.freeze squares
+  return board { boardSquares = squares' }
 
 -- | Check if a square has an adjacent tile
 hasAdjacentTile :: Board -> Row -> Col -> Bool
@@ -579,15 +597,12 @@ loadRow ld board row str = go board 0 str
 
 -- | Transpose the board (swap rows and columns)
 transpose :: Board -> Board
-transpose board = runST $ do
-  rows <- V.thaw (boardSquares board)
+transpose board =
   let dim = boardDim_ board
-
-  -- Create transposed board
-  forM_ [0 .. dim - 1] $ \r -> do
-    newRow <- V.thaw $ V.generate dim $ \c ->
-      boardSquares board V.! c V.! r
-    MV.write rows r =<< V.freeze newRow
-
-  rows' <- V.freeze rows
-  return board { boardSquares = rows' }
+      -- Create new flat vector with transposed indexing
+      newSquares = V.generate (dim * dim) $ \i ->
+        let r = i `div` dim
+            c = i `mod` dim
+            -- Swap r and c for transposition
+        in boardSquares board V.! boardIndex dim c r
+  in board { boardSquares = newSquares }

@@ -74,22 +74,27 @@ newtype MachineLetter = MachineLetter { unML :: Word8 }
   deriving (Eq, Ord, Show, Generic)
 
 -- | Mask for blank designation
+{-# INLINE blankMask #-}
 blankMask :: Word8
 blankMask = 0x80
 
 -- | Played-through marker (same as empty square)
+{-# INLINE playedThroughMarker #-}
 playedThroughMarker :: MachineLetter
 playedThroughMarker = MachineLetter 0
 
 -- | Check if a letter is blanked
+{-# INLINE isBlank #-}
 isBlank :: MachineLetter -> Bool
 isBlank (MachineLetter ml) = testBit ml 7
 
 -- | Mark a letter as played with a blank
+{-# INLINE blankLetter #-}
 blankLetter :: MachineLetter -> MachineLetter
 blankLetter (MachineLetter ml) = MachineLetter (ml .|. blankMask)
 
 -- | Get the underlying letter from a blanked letter
+{-# INLINE unblankLetter #-}
 unblankLetter :: MachineLetter -> MachineLetter
 unblankLetter (MachineLetter ml) = MachineLetter (ml .&. 0x7F)
 
@@ -122,12 +127,14 @@ data BonusSquare
   deriving (Eq, Show, Ord, Enum, Generic)
 
 -- | Get letter multiplier for a bonus square
+{-# INLINE letterMultiplier #-}
 letterMultiplier :: BonusSquare -> Int
 letterMultiplier DoubleLetter = 2
 letterMultiplier TripleLetter = 3
 letterMultiplier _ = 1
 
 -- | Get word multiplier for a bonus square
+{-# INLINE wordMultiplier #-}
 wordMultiplier :: BonusSquare -> Int
 wordMultiplier DoubleWord = 2
 wordMultiplier TripleWord = 3
@@ -165,6 +172,7 @@ data Rack = Rack
   } deriving (Eq, Show, Generic)
 
 -- | Create an empty rack
+{-# INLINE emptyRack #-}
 emptyRack :: Int -> Rack
 emptyRack distSize = Rack
   { rackCounts = VU.replicate distSize 0
@@ -177,36 +185,41 @@ rackSize :: Int
 rackSize = 7
 
 -- | Add a letter to the rack
+{-# INLINE rackAddLetter #-}
 rackAddLetter :: MachineLetter -> Rack -> Rack
 rackAddLetter (MachineLetter ml) rack =
   let idx = fromIntegral ml
       counts = rackCounts rack
-      newCount = (counts VU.! idx) + 1
+      newCount = (counts `VU.unsafeIndex` idx) + 1
   in rack { rackCounts = counts VU.// [(idx, newCount)]
           , rackTotal_ = rackTotal_ rack + 1
           }
 
 -- | Take a letter from the rack
+{-# INLINE rackTakeLetter #-}
 rackTakeLetter :: MachineLetter -> Rack -> Rack
 rackTakeLetter (MachineLetter ml) rack =
   let idx = fromIntegral ml
       counts = rackCounts rack
-      newCount = (counts VU.! idx) - 1
+      newCount = (counts `VU.unsafeIndex` idx) - 1
   in rack { rackCounts = counts VU.// [(idx, newCount)]
           , rackTotal_ = rackTotal_ rack - 1
           }
 
 -- | Check if rack has at least one of a letter
+{-# INLINE rackHasLetter #-}
 rackHasLetter :: MachineLetter -> Rack -> Bool
 rackHasLetter (MachineLetter ml) rack =
-  (rackCounts rack VU.! fromIntegral ml) > 0
+  (rackCounts rack `VU.unsafeIndex` fromIntegral ml) > 0
 
 -- | Get count of a specific letter
+{-# INLINE rackGetCount #-}
 rackGetCount :: MachineLetter -> Rack -> Int
 rackGetCount (MachineLetter ml) rack =
-  rackCounts rack VU.! fromIntegral ml
+  rackCounts rack `VU.unsafeIndex` fromIntegral ml
 
 -- | Get total number of tiles on rack
+{-# INLINE rackTotal #-}
 rackTotal :: Rack -> Int
 rackTotal = rackTotal_
 

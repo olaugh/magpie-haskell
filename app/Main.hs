@@ -50,16 +50,20 @@ runWithKWG kwgPath mldPath = do
       putStrLn "Using default English letter distribution"
       return defaultEnglishLD
 
+  -- Load KLV file at startup (same base name as KWG with .klv2 extension)
+  let klvPath = replaceExtension kwgPath "klv2"
+  mKlv <- tryLoadKLV klvPath
+
   putStrLn $ "Loaded " ++ show (numNodes kwg) ++ " nodes"
   putStrLn ""
   putStrLn "Commands: gen <rack>, play, autoplay [n] [-t threads] [-s seed], anagram <rack>, quit"
   putStrLn ""
 
   hSetBuffering stdout LineBuffering
-  repl kwgPath kwg ld
+  repl kwgPath kwg ld mKlv
 
-repl :: FilePath -> KWG -> LetterDistribution -> IO ()
-repl kwgPath kwg ld = do
+repl :: FilePath -> KWG -> LetterDistribution -> Maybe KLV -> IO ()
+repl kwgPath kwg ld mKlv = do
   putStr "magpie> "
   hFlush stdout
   input <- getLine
@@ -70,21 +74,21 @@ repl kwgPath kwg ld = do
     ["exit"] -> putStrLn "Goodbye!"
     ("gen":rack:_) -> do
       generateForRack kwg ld (map toUpper rack)
-      repl kwgPath kwg ld
+      repl kwgPath kwg ld mKlv
     ("anagram":rack:_) -> do
       findAnagramsCmd kwg ld (map toUpper rack)
-      repl kwgPath kwg ld
+      repl kwgPath kwg ld mKlv
     ["play"] -> do
       playGame kwg ld
-      repl kwgPath kwg ld
+      repl kwgPath kwg ld mKlv
     ("autoplay":args') -> do
-      config <- parseAutoplayArgs kwgPath args'
+      let config = parseAutoplayArgs mKlv args'
       _ <- runAutoplayThreaded kwg ld config
-      repl kwgPath kwg ld
-    [] -> repl kwgPath kwg ld
+      repl kwgPath kwg ld mKlv
+    [] -> repl kwgPath kwg ld mKlv
     _ -> do
       putStrLn "Unknown command. Try: gen <rack>, play, anagram <rack>, quit"
-      repl kwgPath kwg ld
+      repl kwgPath kwg ld mKlv
 
 -- | Generate moves for a rack on an empty board
 generateForRack :: KWG -> LetterDistribution -> String -> IO ()
@@ -116,17 +120,13 @@ printMove ld move =
       putStrLn $ "  " ++ pos ++ dirStr ++ " " ++ tiles ++ " (" ++ show (moveScore move) ++ ")"
 
 -- | Parse autoplay arguments: [n] [-t threads] [-s seed] [-v] [--no-klv]
--- By default, tries to load a .klv2 file with the same base name as the KWG
-parseAutoplayArgs :: FilePath -> [String] -> IO AutoplayConfig
-parseAutoplayArgs kwgPath args = do
+-- Uses the pre-loaded KLV unless --no-klv is specified
+parseAutoplayArgs :: Maybe KLV -> [String] -> AutoplayConfig
+parseAutoplayArgs mKlv args =
   let (config, useKlv) = parseArgs defaultAutoplayConfig True args
-  if useKlv
-    then do
-      -- Try to load KLV from same directory with .klv2 extension
-      let klvPath = replaceExtension kwgPath "klv2"
-      mKlv <- tryLoadKLV klvPath
-      return config { autoplayKLV = mKlv }
-    else return config
+  in if useKlv
+     then config { autoplayKLV = mKlv }
+     else config
   where
     parseArgs config useKlv [] = (config, useKlv)
     parseArgs config useKlv ("-t":tStr:rest) =
@@ -144,20 +144,23 @@ parseAutoplayArgs kwgPath args = do
         Just n -> parseArgs (config { autoplayNumGames = n }) useKlv rest
         Nothing -> parseArgs config useKlv rest
 
-    replaceExtension path ext =
-      let base = reverse $ drop 1 $ dropWhile (/= '.') $ reverse path
-      in if null base then path ++ "." ++ ext else base ++ "." ++ ext
+-- | Replace file extension
+replaceExtension :: FilePath -> String -> FilePath
+replaceExtension path ext =
+  let base = reverse $ drop 1 $ dropWhile (/= '.') $ reverse path
+  in if null base then path ++ "." ++ ext else base ++ "." ++ ext
 
-    tryLoadKLV :: FilePath -> IO (Maybe KLV)
-    tryLoadKLV path = do
-      result <- (Just <$> loadKLV path) `catch` (\(_ :: SomeException) -> return Nothing)
-      case result of
-        Just klv -> do
-          putStrLn $ "Loaded leave values: " ++ path
-          return (Just klv)
-        Nothing -> do
-          putStrLn "Note: No KLV file found, using score-only move selection"
-          return Nothing
+-- | Try to load a KLV file, returning Nothing on failure
+tryLoadKLV :: FilePath -> IO (Maybe KLV)
+tryLoadKLV path = do
+  result <- (Just <$> loadKLV path) `catch` (\(_ :: SomeException) -> return Nothing)
+  case result of
+    Just klv -> do
+      putStrLn $ "Loaded leave values: " ++ path
+      return (Just klv)
+    Nothing -> do
+      putStrLn "Note: No KLV file found, using score-only move selection"
+      return Nothing
 
 -- | Find anagrams command
 findAnagramsCmd :: KWG -> LetterDistribution -> String -> IO ()

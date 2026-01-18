@@ -44,10 +44,12 @@ defaultMoveGenConfig = MoveGenConfig
 type Strip = IM.IntMap MachineLetter
 
 -- | Blank machine letter constant
+{-# INLINE blankML #-}
 blankML :: MachineLetter
 blankML = MachineLetter 0
 
 -- | Played-through marker (letter already on board)
+{-# INLINE playedThroughML #-}
 playedThroughML :: MachineLetter
 playedThroughML = MachineLetter 0xFF
 
@@ -339,6 +341,7 @@ playIsNonemptyAndNonduplicate tilesPlayed uniquePlay =
   (tilesPlayed > 1) || ((tilesPlayed == 1) && uniquePlay)
 
 -- | Main GADDAG move generation (matches MAGPIE's recursive_gen)
+-- Uses accumulator pattern to avoid O(n) list concatenations
 -- col is the current position being examined
 -- leftstrip/rightstrip track word bounds
 -- tilesPlayed tracks tiles placed from rack
@@ -351,9 +354,20 @@ recursiveGen :: MoveGenConfig -> KWG -> LetterDistribution -> Board -> Rack -> W
              -> Strip
              -> [Move]
 recursiveGen cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnchorCol nodeIdx
-             col leftstrip rightstrip uniquePlay mainWordScore wordMult crossScore tilesPlayed strip
-  | nodeIdx == 0 = []
-  | col < 0 || col >= boardDim = []
+             col leftstrip rightstrip uniquePlay mainWordScore wordMult crossScore tilesPlayed strip =
+  recursiveGenAcc cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnchorCol nodeIdx
+                  col leftstrip rightstrip uniquePlay mainWordScore wordMult crossScore tilesPlayed strip []
+
+-- | Accumulator-based version of recursiveGen
+{-# INLINE recursiveGenAcc #-}
+recursiveGenAcc :: MoveGenConfig -> KWG -> LetterDistribution -> Board -> Rack -> Word64
+             -> Direction -> Int -> Int -> Int -> Word32
+             -> Int -> Int -> Int -> Bool -> Int -> Int -> Int -> Int -> Strip
+             -> [Move] -> [Move]
+recursiveGenAcc cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnchorCol nodeIdx
+             col leftstrip rightstrip uniquePlay mainWordScore wordMult crossScore tilesPlayed strip !acc
+  | nodeIdx == 0 = acc
+  | col < 0 || col >= boardDim = acc
   | otherwise =
       let currentLetter = getLetter board row col
           crossSet = getCrossSet board row col
@@ -367,27 +381,30 @@ recursiveGen cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnchorCol 
                -- Mark as played-through in strip
                newStrip = IM.insert col playedThroughML strip
            in if nextNodeIdx == 0 && not accepts
-              then []
-              else goOn cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnchorCol
+              then acc
+              else goOnAcc cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnchorCol
                         nextNodeIdx accepts col currentLetter
-                        leftstrip rightstrip uniquePlay mainWordScore wordMult crossScore tilesPlayed newStrip
+                        leftstrip rightstrip uniquePlay mainWordScore wordMult crossScore tilesPlayed newStrip acc
 
          else -- Try placing from rack
            if not (rackIsEmpty rack) && ((possibleLettersHere .&. rackCrossSet) /= 0)
-           then tryAllLettersAtNode cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnchorCol
+           then tryAllLettersAtNodeAcc cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnchorCol
                                     nodeIdx col leftstrip rightstrip uniquePlay mainWordScore wordMult
-                                    crossScore possibleLettersHere tilesPlayed strip
-           else []
+                                    crossScore possibleLettersHere tilesPlayed strip acc
+           else acc
 
 -- | Try all valid letters at node (matches MAGPIE's letter iteration loop)
-tryAllLettersAtNode :: MoveGenConfig -> KWG -> LetterDistribution -> Board -> Rack -> Word64
+-- Uses accumulator to avoid list concatenations
+{-# INLINE tryAllLettersAtNodeAcc #-}
+tryAllLettersAtNodeAcc :: MoveGenConfig -> KWG -> LetterDistribution -> Board -> Rack -> Word64
                     -> Direction -> Int -> Int -> Int -> Word32
-                    -> Int -> Int -> Int -> Bool -> Int -> Int -> Int -> Word64 -> Int -> Strip -> [Move]
-tryAllLettersAtNode cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnchorCol nodeIdx
-                    col leftstrip rightstrip uniquePlay mainWordScore wordMult crossScore possibleLetters tilesPlayed strip =
-  go nodeIdx
+                    -> Int -> Int -> Int -> Bool -> Int -> Int -> Int -> Word64 -> Int -> Strip
+                    -> [Move] -> [Move]
+tryAllLettersAtNodeAcc cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnchorCol nodeIdx
+                    col leftstrip rightstrip uniquePlay mainWordScore wordMult crossScore possibleLetters tilesPlayed strip !acc0 =
+  go nodeIdx acc0
   where
-    go i =
+    go !i !acc =
       let node = getNode kwg i
           tile = nodeTile node
           ml = MachineLetter (fromIntegral tile)
@@ -396,45 +413,45 @@ tryAllLettersAtNode cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnc
           accepts = nodeAccepts node
           nextNodeIdx = nodeArcIndex node
           isEnd = nodeIsEnd node
-          rest = if isEnd then [] else go (i + 1)
 
           canPlace = tile /= 0 &&
                      (numberOfMl > 0 || hasBlank) &&
                      testBit possibleLetters (fromIntegral tile)
 
-          movesForLetter = if not canPlace
-                           then []
-                           else -- Try natural tile first
-                                let naturalMoves = if numberOfMl > 0
-                                                   then let newRack = rackTakeLetter ml rack
-                                                            newStrip = IM.insert col ml strip
-                                                        in goOn cfg kwg ld board newRack rackCrossSet dir row
-                                                                anchorCol lastAnchorCol nextNodeIdx accepts
-                                                                col ml leftstrip rightstrip uniquePlay
-                                                                mainWordScore wordMult crossScore (tilesPlayed + 1) newStrip
-                                                   else []
-                                    -- Try blank (ALWAYS if available, even if natural was used)
-                                    blankMoves = if hasBlank
-                                                 then let newRack = rackTakeLetter blankML rack
-                                                          blankedML = blankLetter ml  -- Blank representing this letter
-                                                          newStrip = IM.insert col blankedML strip
-                                                      in goOn cfg kwg ld board newRack rackCrossSet dir row
-                                                              anchorCol lastAnchorCol nextNodeIdx accepts
-                                                              col blankedML leftstrip rightstrip uniquePlay
-                                                              mainWordScore wordMult crossScore (tilesPlayed + 1) newStrip
-                                                 else []
-                                in naturalMoves ++ blankMoves
-      in movesForLetter ++ rest
+          -- Process natural tile placement
+          acc1 = if canPlace && numberOfMl > 0
+                 then let newRack = rackTakeLetter ml rack
+                          newStrip = IM.insert col ml strip
+                      in goOnAcc cfg kwg ld board newRack rackCrossSet dir row
+                              anchorCol lastAnchorCol nextNodeIdx accepts
+                              col ml leftstrip rightstrip uniquePlay
+                              mainWordScore wordMult crossScore (tilesPlayed + 1) newStrip acc
+                 else acc
+
+          -- Process blank tile placement
+          acc2 = if canPlace && hasBlank
+                 then let newRack = rackTakeLetter blankML rack
+                          blankedML = blankLetter ml  -- Blank representing this letter
+                          newStrip = IM.insert col blankedML strip
+                      in goOnAcc cfg kwg ld board newRack rackCrossSet dir row
+                              anchorCol lastAnchorCol nextNodeIdx accepts
+                              col blankedML leftstrip rightstrip uniquePlay
+                              mainWordScore wordMult crossScore (tilesPlayed + 1) newStrip acc1
+                 else acc1
+
+      in if isEnd then acc2 else go (i + 1) acc2
 
 -- | Continue generation after placing/traversing a letter (matches MAGPIE's go_on)
-goOn :: MoveGenConfig -> KWG -> LetterDistribution -> Board -> Rack -> Word64
+-- Uses accumulator pattern to avoid list concatenation
+{-# INLINE goOnAcc #-}
+goOnAcc :: MoveGenConfig -> KWG -> LetterDistribution -> Board -> Rack -> Word64
      -> Direction -> Int -> Int -> Int -> Word32 -> Bool
      -> Int -> MachineLetter  -- current_col, letter placed
      -> Int -> Int -> Bool -> Int -> Int -> Int -> Int  -- leftstrip, rightstrip, uniquePlay, scores, tilesPlayed
      -> Strip
-     -> [Move]
-goOn cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnchorCol newNodeIdx accepts
-     currentCol letterPlaced leftstrip rightstrip uniquePlay mainWordScore wordMult crossScore tilesPlayed strip =
+     -> [Move] -> [Move]
+goOnAcc cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnchorCol newNodeIdx accepts
+     currentCol letterPlaced leftstrip rightstrip uniquePlay mainWordScore wordMult crossScore tilesPlayed strip !acc =
   let -- Determine if this is a fresh tile (from rack) or playing through
       squareIsEmpty = isEmpty board row currentCol
 
@@ -476,27 +493,27 @@ goOn cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnchorCol newNodeI
            noLetterRightOfAnchor = anchorCol == boardDim - 1 || isEmpty board row (anchorCol + 1)
 
            -- Record move if this is a valid word end (no letters on either side)
-           recordedMoves = if accepts && noLetterDirectlyLeft && noLetterRightOfAnchor &&
-                              playIsNonemptyAndNonduplicate tilesPlayed newUniquePlay
-                           then [buildMove cfg board row newLeftstrip rightstrip newMainScore newWordMult newCrossScore tilesPlayed strip]
-                           else []
+           acc1 = if accepts && noLetterDirectlyLeft && noLetterRightOfAnchor &&
+                     playIsNonemptyAndNonduplicate tilesPlayed newUniquePlay
+                  then buildMove cfg board row newLeftstrip rightstrip newMainScore newWordMult newCrossScore tilesPlayed strip : acc
+                  else acc
 
            -- Continue left (if node continues and we haven't hit lastAnchorCol)
-           leftMoves = if newNodeIdx /= 0 && currentCol > 0 && (currentCol - 1) /= lastAnchorCol
-                       then recursiveGen cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnchorCol
+           acc2 = if newNodeIdx /= 0 && currentCol > 0 && (currentCol - 1) /= lastAnchorCol
+                  then recursiveGenAcc cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnchorCol
                                         newNodeIdx (currentCol - 1) newLeftstrip rightstrip
-                                        newUniquePlay newMainScore newWordMult newCrossScore tilesPlayed strip
-                       else []
+                                        newUniquePlay newMainScore newWordMult newCrossScore tilesPlayed strip acc1
+                  else acc1
 
            -- Cross separator to go right (if valid)
            separatorNode = getSeparatorArc kwg newNodeIdx
-           rightMoves = if separatorNode /= 0 && noLetterDirectlyLeft && anchorCol < boardDim - 1
-                        then recursiveGen cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnchorCol
+           acc3 = if separatorNode /= 0 && noLetterDirectlyLeft && anchorCol < boardDim - 1
+                  then recursiveGenAcc cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnchorCol
                                          separatorNode (anchorCol + 1) newLeftstrip rightstrip
-                                         newUniquePlay newMainScore newWordMult newCrossScore tilesPlayed strip
-                        else []
+                                         newUniquePlay newMainScore newWordMult newCrossScore tilesPlayed strip acc2
+                  else acc2
 
-       in recordedMoves ++ leftMoves ++ rightMoves
+       in acc3
 
      else -- Right of anchor
        let -- Update uniquePlay for vertical direction
@@ -510,19 +527,19 @@ goOn cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnchorCol newNodeI
            noLetterDirectlyRight = currentCol == boardDim - 1 || isEmpty board row (currentCol + 1)
 
            -- Record move if this is a valid word end
-           recordedMoves = if accepts && noLetterDirectlyRight &&
-                              playIsNonemptyAndNonduplicate tilesPlayed newUniquePlay
-                           then [buildMove cfg board row leftstrip newRightstrip newMainScore newWordMult newCrossScore tilesPlayed strip]
-                           else []
+           acc1 = if accepts && noLetterDirectlyRight &&
+                     playIsNonemptyAndNonduplicate tilesPlayed newUniquePlay
+                  then buildMove cfg board row leftstrip newRightstrip newMainScore newWordMult newCrossScore tilesPlayed strip : acc
+                  else acc
 
            -- Continue right
-           rightMoves = if newNodeIdx /= 0 && currentCol < boardDim - 1
-                        then recursiveGen cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnchorCol
+           acc2 = if newNodeIdx /= 0 && currentCol < boardDim - 1
+                  then recursiveGenAcc cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnchorCol
                                          newNodeIdx (currentCol + 1) leftstrip newRightstrip
-                                         newUniquePlay newMainScore newWordMult newCrossScore tilesPlayed strip
-                        else []
+                                         newUniquePlay newMainScore newWordMult newCrossScore tilesPlayed strip acc1
+                  else acc1
 
-       in recordedMoves ++ rightMoves
+       in acc2
 
 -- | Get separator arc (transition from prefix to suffix in GADDAG)
 getSeparatorArc :: KWG -> Word32 -> Word32
