@@ -12,6 +12,14 @@ module Magpie.Board
   , isEmpty
   , isOnBoard
 
+    -- * Direction-aware accessors (for vertical moves without transpose)
+  , getLetterDir
+  , getSquareDir
+  , isEmptyDir
+  , getCrossSetDir
+  , getCrossScoreDir
+  , isAnchorDir
+
     -- * Cross-set computation
   , computeCrossSets
   , getCrossSet
@@ -149,6 +157,45 @@ getSquare board r c
 {-# INLINE isEmpty #-}
 isEmpty :: Board -> Row -> Col -> Bool
 isEmpty board r c = unML (getLetter board r c) == 0
+
+-- Direction-aware accessors: for Vertical direction, swap row and col
+-- This allows vertical move generation without transposing the board
+
+-- | Get letter with direction-aware indexing
+{-# INLINE getLetterDir #-}
+getLetterDir :: Board -> Direction -> Int -> Int -> MachineLetter
+getLetterDir board Horizontal row col = getLetter board row col
+getLetterDir board Vertical row col = getLetter board col row
+
+-- | Get square with direction-aware indexing
+{-# INLINE getSquareDir #-}
+getSquareDir :: Board -> Direction -> Int -> Int -> Square
+getSquareDir board Horizontal row col = getSquare board row col
+getSquareDir board Vertical row col = getSquare board col row
+
+-- | Check if empty with direction-aware indexing
+{-# INLINE isEmptyDir #-}
+isEmptyDir :: Board -> Direction -> Int -> Int -> Bool
+isEmptyDir board Horizontal row col = isEmpty board row col
+isEmptyDir board Vertical row col = isEmpty board col row
+
+-- | Get cross-set with direction-aware indexing
+{-# INLINE getCrossSetDir #-}
+getCrossSetDir :: Board -> Direction -> Int -> Int -> Word64
+getCrossSetDir board Horizontal row col = getCrossSet board row col
+getCrossSetDir board Vertical row col = getCrossSet board col row
+
+-- | Get cross-score with direction-aware indexing
+{-# INLINE getCrossScoreDir #-}
+getCrossScoreDir :: Board -> Direction -> Int -> Int -> Int
+getCrossScoreDir board Horizontal row col = getCrossScore board row col
+getCrossScoreDir board Vertical row col = getCrossScore board col row
+
+-- | Check if anchor with direction-aware indexing
+{-# INLINE isAnchorDir #-}
+isAnchorDir :: Board -> Direction -> Int -> Int -> Bool
+isAnchorDir board Horizontal row col = isAnchor board row col
+isAnchorDir board Vertical row col = isAnchor board col row
 
 -- | Compute cross-sets for all squares (for a given direction)
 -- A cross-set indicates which letters can legally be played at a square

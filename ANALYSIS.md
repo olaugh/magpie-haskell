@@ -195,10 +195,10 @@ The Haskell implementation is a faithful port of MAGPIE's algorithms, but uses i
 ## Summary of Performance-Critical Differences
 
 ### High Impact
-1. **Rack operations**: Copy-on-write VU.Vector vs in-place mutation
+1. **Rack operations**: ~~Copy-on-write VU.Vector vs in-place mutation~~ **FIXED**: Using `klvGetLeaveValueFromTiles` avoids intermediate rack allocation
 2. **Move list allocation**: List `[MachineLetter]` vs fixed array
-3. **Board transpose**: Creates full board copy for vertical moves
-4. **Score-to-Equity conversion**: Not pre-computed in LetterDistribution
+3. **Board transpose**: ~~Creates full board copy for vertical moves~~ **FIXED**: Direction-aware accessors eliminate transpose
+4. **Score-to-Equity conversion**: ~~Not pre-computed in LetterDistribution~~ **FIXED**: `ldScoresEq` stores pre-computed Equity values
 
 ### Medium Impact
 5. **Shadow state threading**: Immutable record updates vs mutation
@@ -218,21 +218,36 @@ The Haskell implementation is a faithful port of MAGPIE's algorithms, but uses i
 - ST-based `generateBestMove` with mutable rack and strip
 - Best-move-only tracking to avoid Move list allocation
 - Shadow pruning with equity comparison
+- **Pre-computed Equity scores in LetterDistribution** (`ldScoresEq` field, `ldScoreEquity` accessor)
+- **Direction-aware board accessors** (`getLetterDir`, `getCrossSetDir`, etc.) to eliminate board transpose
+- **Efficient leave value computation** using `klvGetLeaveValueFromTiles` instead of allocating intermediate Rack
+
+---
+
+## Profiling Results (Jan 2026)
+
+With -O2, achieving ~77-93 games/sec (10 threads). Profile breakdown (50 games, 13.6 GB total alloc):
+
+| Cost Centre | Time | Alloc | Notes |
+|-------------|------|-------|-------|
+| generateBestMove | 70% | 60.8% | Bulk of recursive generation |
+| leaveValueComputation | 6.9% | 5.5% | KLV lookups via klvGetLeaveValueFromTiles |
+| computeCrossSets | 5.7% | 2.7% | Pre-computation per direction |
+| shadowPlayForAnchor | 4.5% | 9.5% | Anchor generation with shadow scoring |
+| getCrossSet/getCrossScore | 6.6% | 3.5% | Board access during generation |
+| buildMoveST + extractTilesST | 0.6% | 2.5% | Move construction |
+
+**Key insight**: Most allocation is in the recursive generation itself (closures, intermediate values), not in move construction.
+
+### Recently Implemented
+- **Deferred move construction** (`tryRecordMove`): Only builds full Move when (score + maxLeaveValue) > currentBest, avoiding allocations for candidates that can't win
 
 ### Should Implement
-1. **Store scores as Equity in LetterDistribution**
-   - Add `ldScoresEquity :: VU.Vector Equity`
-   - Avoid `fromIntegral * 1000` in hot path
-
-2. **Direction-parameterized board access** (instead of transpose)
-   - More complex code but avoids board copy
-   - Could use type-level direction for zero-cost abstraction
-
-3. **Unboxed Move representation for internal use**
+1. **Unboxed Move representation for internal use**
    - Fixed-size array for tiles instead of list
    - Only convert to user-facing `Move` at output
 
 ### Consider for Future
-4. **Mutable shadow state** (ST-based shadow scoring)
-5. **Pre-allocated multiplier arrays** instead of lists
-6. **Compact rack representation** (bit-packed counts)
+3. **Mutable shadow state** (ST-based shadow scoring)
+4. **Pre-allocated multiplier arrays** instead of lists
+5. **Compact rack representation** (bit-packed counts)

@@ -16,7 +16,7 @@ module Magpie.MoveGen
 
 import Magpie.Types
 import Magpie.KWG
-import Magpie.KLV (KLV, klvGetLeaveValue)
+import Magpie.KLV (KLV, klvGetLeaveValueFromTiles)
 import Magpie.Board
 import Magpie.LetterDistribution
 import Magpie.Shadow (generateAnchors, Anchor(..), ShadowConfig(..), defaultShadowConfig)
@@ -134,10 +134,11 @@ generateBestMove cfg mKlv kwg ld board rack bagCount =
   let rackCrossSet = computeRackCrossSet rack (ldSize ld)
       distSize = ldSize ld
 
-      -- Prepare boards for both directions (pre-compute once)
+      -- Prepare boards for both directions (pre-compute cross-sets once)
+      -- Cross-sets for Horizontal moves (checking Vertical perpendiculars)
       boardH = computeAnchors $ computeCrossSets kwg ld Horizontal board
-      transBoard = transpose board
-      boardVTrans = computeAnchors $ computeCrossSets kwg ld Horizontal transBoard
+      -- Cross-sets for Vertical moves (checking Horizontal perpendiculars)
+      boardV = computeAnchors $ computeCrossSets kwg ld Vertical board
 
       -- Generate shadow anchors (sorted by highest possible equity descending)
       shadowCfg = defaultShadowConfig { shadowBingoBonus = mgcBingoBonus cfg }
@@ -151,9 +152,8 @@ generateBestMove cfg mKlv kwg ld board rack bagCount =
       computeEquity m =
         let score = moveScore m
             tiles = moveTiles m
-            leave = computeLeave rack tiles
             leaveVal = case mKlv of
-              Just klv -> klvGetLeaveValue klv leave
+              Just klv -> klvGetLeaveValueFromTiles klv rack tiles
               Nothing  -> 0
         in Equity (fromIntegral score * 1000 + leaveVal)
 
@@ -207,19 +207,22 @@ generateBestMove cfg mKlv kwg ld board rack bagCount =
                   ancRow = anchorRow anchor
                   ancCol = anchorCol anchor
                   lastAnchorCol = anchorLastAnchorCol anchor
+                  -- For Vertical: swap row/col so "row" is the line of travel (column in board space)
+                  -- For Horizontal: row/col stay as-is
+                  (genRow, genAncCol, genLastAncCol) = case dir of
+                    Horizontal -> (ancRow, ancCol, lastAnchorCol)
+                    Vertical   -> (ancCol, ancRow, lastAnchorCol)
+                  boardForDir = case dir of
+                    Horizontal -> boardH
+                    Vertical   -> boardV
+                  initialUniquePlay = case dir of
+                    Horizontal -> True
+                    Vertical   -> False
 
-              case dir of
-                Horizontal ->
-                  recursiveGenBestST cfg mKlv rack kwg ld boardH rackM rackCrossSet
-                                     Horizontal ancRow ancCol lastAnchorCol
-                                     (gaddagRoot kwg) ancCol ancCol ancCol
-                                     True 0 1 0 0 distSize strip bestRef
-                Vertical ->
-                  -- For vertical: use transposed board, swap row/col for anchor
-                  recursiveGenBestSTTransposed cfg mKlv rack kwg ld boardVTrans rackM rackCrossSet
-                                               ancCol ancRow lastAnchorCol
-                                               (gaddagRoot kwg) ancRow ancRow ancRow
-                                               False 0 1 0 0 distSize strip bestRef
+              recursiveGenBestSTDir cfg mKlv rack maxLeaveValue kwg ld boardForDir rackM rackCrossSet
+                                    dir genRow genAncCol genLastAncCol
+                                    (gaddagRoot kwg) genAncCol genAncCol genAncCol
+                                    initialUniquePlay 0 1 0 0 distSize strip bestRef
 
               loop rest
 
@@ -745,21 +748,43 @@ mrackIsEmpty rackM distSize = go 0
 -- | Reference to best move found so far
 type BestMoveRef s = STRef s (Move, Equity)  -- (move, equity)
 
--- | Record a move if it's better than current best
-{-# INLINE recordBestMove #-}
-recordBestMove :: Maybe KLV -> Rack -> BestMoveRef s -> Move -> ST s ()
-recordBestMove mKlv origRack bestRef move = do
-  let score = moveScore move
-      tiles = moveTiles move
-      leave = computeLeave origRack tiles
-      leaveVal = case mKlv of
-        Just klv -> klvGetLeaveValue klv leave
-        Nothing  -> 0
-      equity = Equity (fromIntegral score * 1000 + leaveVal)
-      moveWithEquity = move { moveEquity = equity }
+-- | Try to record a move, but only build it if score could beat current best
+-- This defers move construction for moves that can't possibly win
+-- maxLeaveVal is the maximum possible leave value (75000 in fixed-point for KLV)
+{-# INLINE tryRecordMove #-}
+tryRecordMove :: MoveGenConfig -> Maybe KLV -> Rack -> Int32 -> BestMoveRef s
+              -> Direction -> Int -> Int -> Int -> Int -> Int -> Int -> Int
+              -> MStrip s -> ST s ()
+tryRecordMove cfg mKlv origRack maxLeaveVal bestRef dir row leftstrip rightstrip
+              mainScore wordMult crossScore tilesUsed strip = do
+  let finalMainScore = mainScore * wordMult
+      bingoBonus = if tilesUsed >= defaultRackSize then mgcBingoBonus cfg else 0
+      totalScore = finalMainScore + crossScore + bingoBonus
+      -- Max possible equity for this move
+      maxPossibleEquity = Equity (fromIntegral totalScore * 1000 + maxLeaveVal)
   (_, currentBest) <- readSTRef bestRef
-  when (equity > currentBest) $
-    writeSTRef bestRef (moveWithEquity, equity)
+  -- Only build the full move if it might beat current best
+  when (maxPossibleEquity > currentBest) $ do
+    tiles <- extractTilesST strip leftstrip rightstrip
+    let leaveVal = case mKlv of
+          Just klv -> klvGetLeaveValueFromTiles klv origRack tiles
+          Nothing  -> 0
+        equity = Equity (fromIntegral totalScore * 1000 + leaveVal)
+    when (equity > currentBest) $ do
+      let (outRow, outCol) = case dir of
+            Horizontal -> (row, leftstrip)
+            Vertical   -> (leftstrip, row)
+          move = Move
+            { moveType = TilePlacement
+            , moveRow = outRow
+            , moveCol = outCol
+            , moveDir = dir
+            , moveTiles = tiles
+            , moveTilesUsed = tilesUsed
+            , moveScore = totalScore
+            , moveEquity = equity
+            }
+      writeSTRef bestRef (move, equity)
 
 -- | Extract tiles from mutable strip
 {-# INLINE extractTilesST #-}
@@ -775,16 +800,19 @@ extractTilesST strip leftstrip rightstrip = go leftstrip []
             else go (col + 1) (ml : acc)
 
 -- | ST-based recursive generation that only tracks the best move
--- This version captures common state in closures to reduce parameter passing
-recursiveGenBestST :: MoveGenConfig -> Maybe KLV -> Rack -> KWG -> LetterDistribution -> Board
-                   -> MRackCounts s -> Word64 -> Direction -> Int -> Int -> Int -> Word32
-                   -> Int -> Int -> Int -> Bool -> Int -> Int -> Int -> Int
-                   -> Int -> MStrip s -> BestMoveRef s -> ST s ()
-recursiveGenBestST cfg mKlv origRack kwg ld board rackM rackCrossSet
-                   dir row anchorCol lastAnchorCol initialNodeIdx
-                   initialCol initialLeftstrip initialRightstrip initialUniquePlay
-                   initialMainScore initialWordMult initialCrossScore initialTilesPlayed
-                   distSize strip bestRef =
+-- Uses direction-aware accessors to avoid board transpose for vertical moves
+-- For Horizontal: row = actual row, col = column position
+-- For Vertical: row = actual column (line of travel), col = row position
+-- The direction-aware accessors handle the coordinate mapping
+recursiveGenBestSTDir :: MoveGenConfig -> Maybe KLV -> Rack -> Int32 -> KWG -> LetterDistribution -> Board
+                      -> MRackCounts s -> Word64 -> Direction -> Int -> Int -> Int -> Word32
+                      -> Int -> Int -> Int -> Bool -> Int -> Int -> Int -> Int
+                      -> Int -> MStrip s -> BestMoveRef s -> ST s ()
+recursiveGenBestSTDir cfg mKlv origRack maxLeaveVal kwg ld board rackM rackCrossSet
+                      dir row anchorCol lastAnchorCol initialNodeIdx
+                      initialCol initialLeftstrip initialRightstrip initialUniquePlay
+                      initialMainScore initialWordMult initialCrossScore initialTilesPlayed
+                      distSize strip bestRef =
   recGen initialNodeIdx initialCol initialLeftstrip initialRightstrip
          initialUniquePlay initialMainScore initialWordMult initialCrossScore initialTilesPlayed
   where
@@ -795,8 +823,9 @@ recursiveGenBestST cfg mKlv origRack kwg ld board rackM rackCrossSet
       | nodeIdx == 0 = return ()
       | col < 0 || col >= boardDim = return ()
       | otherwise = do
-          let currentLetter = getLetter board row col
-              crossSet = getCrossSet board row col
+          -- Use direction-aware accessors for board access
+          let currentLetter = getLetterDir board dir row col
+              crossSet = getCrossSetDir board dir row col
               possibleLettersHere = if crossSet == 1 then 0 else crossSet
 
           if unML currentLetter /= 0
@@ -849,8 +878,9 @@ recursiveGenBestST cfg mKlv origRack kwg ld board rackM rackCrossSet
 
     goOn !nodeIdx !accepts !currentCol !letterPlaced !leftstrip !rightstrip
          !uniquePlay !mainWordScore !wordMult !crossScore !tilesPlayed = do
-      let squareIsEmpty = isEmpty board row currentCol
-          sq = getSquare board row currentCol
+      -- Use direction-aware accessors for all board access
+      let squareIsEmpty = isEmptyDir board dir row currentCol
+          sq = getSquareDir board dir row currentCol
           bonus = sqBonus sq
           letterMult = if squareIsEmpty then letterMultiplier bonus else 1
           thisWordMult = if squareIsEmpty then wordMultiplier bonus else 1
@@ -859,7 +889,7 @@ recursiveGenBestST cfg mKlv origRack kwg ld board rackM rackCrossSet
           tileScore = if isBlank letterPlaced then 0 else ldScore ld ml
           scoredLetter = tileScore * letterMult
           newMainScore = mainWordScore + scoredLetter
-          crossWordBase = if squareIsEmpty then getCrossScore board row currentCol else 0
+          crossWordBase = if squareIsEmpty then getCrossScoreDir board dir row currentCol else 0
           newCrossScore = if crossWordBase > 0
                           then crossScore + (crossWordBase + scoredLetter) * thisWordMult
                           else crossScore
@@ -868,18 +898,17 @@ recursiveGenBestST cfg mKlv origRack kwg ld board rackM rackCrossSet
         then do
           let newUniquePlay = case dir of
                 Horizontal -> uniquePlay
-                Vertical -> if squareIsEmpty && getCrossSet board row currentCol == trivialCrossSet distSize
+                Vertical -> if squareIsEmpty && getCrossSetDir board dir row currentCol == trivialCrossSet distSize
                             then True
                             else uniquePlay
               newLeftstrip = currentCol
-              noLetterDirectlyLeft = currentCol == 0 || isEmpty board row (currentCol - 1)
-              noLetterRightOfAnchor = anchorCol == boardDim - 1 || isEmpty board row (anchorCol + 1)
+              noLetterDirectlyLeft = currentCol == 0 || isEmptyDir board dir row (currentCol - 1)
+              noLetterRightOfAnchor = anchorCol == boardDim - 1 || isEmptyDir board dir row (anchorCol + 1)
 
           when (accepts && noLetterDirectlyLeft && noLetterRightOfAnchor &&
-                playIsNonemptyAndNonduplicate tilesPlayed newUniquePlay) $ do
-            move <- buildMoveST cfg board row newLeftstrip rightstrip newMainScore newWordMult
-                                newCrossScore tilesPlayed strip
-            recordBestMove mKlv origRack bestRef move
+                playIsNonemptyAndNonduplicate tilesPlayed newUniquePlay) $
+            tryRecordMove cfg mKlv origRack maxLeaveVal bestRef dir row newLeftstrip rightstrip
+                          newMainScore newWordMult newCrossScore tilesPlayed strip
 
           when (nodeIdx /= 0 && currentCol > 0 && (currentCol - 1) /= lastAnchorCol) $
             recGen nodeIdx (currentCol - 1) newLeftstrip rightstrip
@@ -891,186 +920,20 @@ recursiveGenBestST cfg mKlv origRack kwg ld board rackM rackCrossSet
                    newUniquePlay newMainScore newWordMult newCrossScore tilesPlayed
         else do
           let newRightstrip = currentCol
-              noLetterDirectlyRight = currentCol == boardDim - 1 || isEmpty board row (currentCol + 1)
+              noLetterDirectlyRight = currentCol == boardDim - 1 || isEmptyDir board dir row (currentCol + 1)
               newUniquePlay = case dir of
                 Horizontal -> uniquePlay
-                Vertical -> if squareIsEmpty && not uniquePlay && getCrossSet board row currentCol == trivialCrossSet distSize
+                Vertical -> if squareIsEmpty && not uniquePlay && getCrossSetDir board dir row currentCol == trivialCrossSet distSize
                             then True
                             else uniquePlay
 
           when (accepts && noLetterDirectlyRight &&
-                playIsNonemptyAndNonduplicate tilesPlayed newUniquePlay) $ do
-            move <- buildMoveST cfg board row leftstrip newRightstrip newMainScore newWordMult
-                                newCrossScore tilesPlayed strip
-            recordBestMove mKlv origRack bestRef move
+                playIsNonemptyAndNonduplicate tilesPlayed newUniquePlay) $
+            tryRecordMove cfg mKlv origRack maxLeaveVal bestRef dir row leftstrip newRightstrip
+                          newMainScore newWordMult newCrossScore tilesPlayed strip
 
           when (nodeIdx /= 0 && currentCol < boardDim - 1) $
             recGen nodeIdx (currentCol + 1) leftstrip newRightstrip
                    newUniquePlay newMainScore newWordMult newCrossScore tilesPlayed
 
--- | Build a move from mutable strip (ST version)
-buildMoveST :: MoveGenConfig -> Board -> Int -> Int -> Int -> Int -> Int -> Int -> Int
-            -> MStrip s -> ST s Move
-buildMoveST cfg _board row leftstrip rightstrip mainScore wordMult crossScore tilesUsed strip = do
-  let finalMainScore = mainScore * wordMult
-      bingoBonus = if tilesUsed >= defaultRackSize then mgcBingoBonus cfg else 0
-      totalScore = finalMainScore + crossScore + bingoBonus
-  tiles <- extractTilesST strip leftstrip rightstrip
-  return Move
-    { moveType = TilePlacement
-    , moveRow = row
-    , moveCol = leftstrip
-    , moveDir = Horizontal
-    , moveTiles = tiles
-    , moveTilesUsed = tilesUsed
-    , moveScore = totalScore
-    , moveEquity = Equity (fromIntegral totalScore * 1000)
-    }
 
--- | ST-based recursive generation for transposed board (vertical moves)
--- Records moves with transposed coordinates
--- This version captures common state in closures to reduce parameter passing
-recursiveGenBestSTTransposed :: MoveGenConfig -> Maybe KLV -> Rack -> KWG -> LetterDistribution -> Board
-                             -> MRackCounts s -> Word64 -> Int -> Int -> Int -> Word32
-                             -> Int -> Int -> Int -> Bool -> Int -> Int -> Int -> Int
-                             -> Int -> MStrip s -> BestMoveRef s -> ST s ()
-recursiveGenBestSTTransposed cfg mKlv origRack kwg ld board rackM rackCrossSet
-                             row anchorCol lastAnchorCol initialNodeIdx
-                             initialCol initialLeftstrip initialRightstrip initialUniquePlay
-                             initialMainScore initialWordMult initialCrossScore initialTilesPlayed
-                             distSize strip bestRef =
-  recGen initialNodeIdx initialCol initialLeftstrip initialRightstrip
-         initialUniquePlay initialMainScore initialWordMult initialCrossScore initialTilesPlayed
-  where
-    recGen !nodeIdx !col !leftstrip !rightstrip !uniquePlay !mainWordScore !wordMult !crossScore !tilesPlayed
-      | nodeIdx == 0 = return ()
-      | col < 0 || col >= boardDim = return ()
-      | otherwise = do
-          let currentLetter = getLetter board row col
-              crossSet = getCrossSet board row col
-              possibleLettersHere = if crossSet == 1 then 0 else crossSet
-
-          if unML currentLetter /= 0
-            then do
-              let rawLetter = unblankLetter currentLetter
-                  (nextNodeIdx, accepts) = getNextNodeAndAccepts kwg nodeIdx rawLetter
-              when (nextNodeIdx /= 0 || accepts) $ do
-                mstripWrite strip col playedThroughML
-                goOn nextNodeIdx accepts col currentLetter leftstrip rightstrip
-                     uniquePlay mainWordScore wordMult crossScore tilesPlayed
-                mstripClear strip col
-            else do
-              isEmpty' <- mrackIsEmpty rackM distSize
-              when (not isEmpty' && ((possibleLettersHere .&. rackCrossSet) /= 0)) $
-                tryAllLetters nodeIdx col leftstrip rightstrip uniquePlay mainWordScore wordMult
-                              crossScore possibleLettersHere tilesPlayed
-
-    tryAllLetters !nodeIdx !col !leftstrip !rightstrip !uniquePlay !mainWordScore !wordMult
-                  !crossScore !possibleLetters !tilesPlayed = go nodeIdx
-      where
-        go !i = do
-          let node = getNode kwg i
-              tile = nodeTile node
-              ml = MachineLetter (fromIntegral tile)
-              accepts = nodeAccepts node
-              nextNodeIdx = nodeArcIndex node
-              isEnd = nodeIsEnd node
-
-          when (tile /= 0 && testBit possibleLetters (fromIntegral tile)) $ do
-            numberOfMl <- mrackGetCount rackM ml
-            when (numberOfMl > 0) $ do
-              _ <- mrackTake rackM ml
-              mstripWrite strip col ml
-              goOn nextNodeIdx accepts col ml leftstrip rightstrip uniquePlay
-                   mainWordScore wordMult crossScore (tilesPlayed + 1)
-              mstripClear strip col
-              mrackReturn rackM ml
-
-            hasBlank <- mrackHas rackM blankML
-            when hasBlank $ do
-              let blankedML = blankLetter ml
-              _ <- mrackTake rackM blankML
-              mstripWrite strip col blankedML
-              goOn nextNodeIdx accepts col blankedML leftstrip rightstrip uniquePlay
-                   mainWordScore wordMult crossScore (tilesPlayed + 1)
-              mstripClear strip col
-              mrackReturn rackM blankML
-
-          when (not isEnd) $ go (i + 1)
-
-    goOn !nodeIdx !accepts !currentCol !letterPlaced !leftstrip !rightstrip
-         !uniquePlay !mainWordScore !wordMult !crossScore !tilesPlayed = do
-      let squareIsEmpty = isEmpty board row currentCol
-          sq = getSquare board row currentCol
-          bonus = sqBonus sq
-          letterMult = if squareIsEmpty then letterMultiplier bonus else 1
-          thisWordMult = if squareIsEmpty then wordMultiplier bonus else 1
-          newWordMult = wordMult * thisWordMult
-          ml = unblankLetter letterPlaced
-          tileScore = if isBlank letterPlaced then 0 else ldScore ld ml
-          scoredLetter = tileScore * letterMult
-          newMainScore = mainWordScore + scoredLetter
-          crossWordBase = if squareIsEmpty then getCrossScore board row currentCol else 0
-          newCrossScore = if crossWordBase > 0
-                          then crossScore + (crossWordBase + scoredLetter) * thisWordMult
-                          else crossScore
-
-      if currentCol <= anchorCol
-        then do
-          let newUniquePlay = if squareIsEmpty && getCrossSet board row currentCol == trivialCrossSet distSize
-                              then True
-                              else uniquePlay
-              newLeftstrip = currentCol
-              noLetterDirectlyLeft = currentCol == 0 || isEmpty board row (currentCol - 1)
-              noLetterRightOfAnchor = anchorCol == boardDim - 1 || isEmpty board row (anchorCol + 1)
-
-          when (accepts && noLetterDirectlyLeft && noLetterRightOfAnchor &&
-                playIsNonemptyAndNonduplicate tilesPlayed newUniquePlay) $ do
-            move <- buildMoveSTTransposed cfg board row newLeftstrip rightstrip newMainScore newWordMult
-                                          newCrossScore tilesPlayed strip
-            recordBestMove mKlv origRack bestRef move
-
-          when (nodeIdx /= 0 && currentCol > 0 && (currentCol - 1) /= lastAnchorCol) $
-            recGen nodeIdx (currentCol - 1) newLeftstrip rightstrip
-                   newUniquePlay newMainScore newWordMult newCrossScore tilesPlayed
-
-          let separatorNode = getSeparatorArc kwg nodeIdx
-          when (separatorNode /= 0 && noLetterDirectlyLeft && anchorCol < boardDim - 1) $
-            recGen separatorNode (anchorCol + 1) newLeftstrip rightstrip
-                   newUniquePlay newMainScore newWordMult newCrossScore tilesPlayed
-        else do
-          let newRightstrip = currentCol
-              noLetterDirectlyRight = currentCol == boardDim - 1 || isEmpty board row (currentCol + 1)
-              newUniquePlay = if squareIsEmpty && not uniquePlay && getCrossSet board row currentCol == trivialCrossSet distSize
-                              then True
-                              else uniquePlay
-
-          when (accepts && noLetterDirectlyRight &&
-                playIsNonemptyAndNonduplicate tilesPlayed newUniquePlay) $ do
-            move <- buildMoveSTTransposed cfg board row leftstrip newRightstrip newMainScore newWordMult
-                                          newCrossScore tilesPlayed strip
-            recordBestMove mKlv origRack bestRef move
-
-          when (nodeIdx /= 0 && currentCol < boardDim - 1) $
-            recGen nodeIdx (currentCol + 1) leftstrip newRightstrip
-                   newUniquePlay newMainScore newWordMult newCrossScore tilesPlayed
-
--- | Build a move from mutable strip with transposed coordinates
-buildMoveSTTransposed :: MoveGenConfig -> Board -> Int -> Int -> Int -> Int -> Int -> Int -> Int
-                      -> MStrip s -> ST s Move
-buildMoveSTTransposed cfg _board row leftstrip rightstrip mainScore wordMult crossScore tilesUsed strip = do
-  let finalMainScore = mainScore * wordMult
-      bingoBonus = if tilesUsed >= defaultRackSize then mgcBingoBonus cfg else 0
-      totalScore = finalMainScore + crossScore + bingoBonus
-  tiles <- extractTilesST strip leftstrip rightstrip
-  -- Transpose: swap row and col, mark as Vertical
-  return Move
-    { moveType = TilePlacement
-    , moveRow = leftstrip      -- transposed: leftstrip becomes row
-    , moveCol = row            -- transposed: row becomes col
-    , moveDir = Vertical
-    , moveTiles = tiles
-    , moveTilesUsed = tilesUsed
-    , moveScore = totalScore
-    , moveEquity = Equity (fromIntegral totalScore * 1000)
-    }

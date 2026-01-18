@@ -31,28 +31,29 @@ The core move generation engine is functional and produces correct results:
    - Profile to identify remaining bottlenecks
    - Target should be significantly higher for practical WMP simulation
 
-2. **Equity Throughout**
-   - MAGPIE C stores all scores as Equity from the start
-   - Tile scores are converted to Equity early (in LetterDistribution)
-   - This avoids repeated int-to-equity conversions during move generation
-   - Consider: `ldTileScore :: LetterDistribution -> MachineLetter -> Equity`
+### Completed Optimizations
+
+2. **Equity Throughout** ✓
+   - Added `ldScoresEq :: VU.Vector Equity` to LetterDistribution
+   - Added `ldScoreEquity` accessor for pre-computed 1000x fixed-point scores
+   - Avoids repeated `fromIntegral * 1000` conversions in hot path
+
+3. **Vertical Move Generation** ✓
+   - Implemented direction-aware board accessors (`getLetterDir`, `getCrossSetDir`, etc.)
+   - Unified `recursiveGenBestSTDir` handles both directions without board transpose
+   - Eliminates O(n²) board copy for vertical moves
+
+4. **Leave Value Computation** ✓
+   - Using `klvGetLeaveValueFromTiles` which computes leave value directly from tiles
+   - Avoids allocating intermediate `Rack` for each move considered
+   - KLV lookup remains efficient (DAWG traversal)
 
 ### Medium Priority
 
-3. **Move Representation**
+5. **Move Representation**
    - Current `Move` type uses `[MachineLetter]` for tiles (list allocation)
    - Consider unboxed vector or fixed-size array for hot path
    - The `moveTiles` field is only needed for final output, not during search
-
-4. **Vertical Move Generation**
-   - Currently uses board transpose, then transposes moves back
-   - Works correctly but may have overhead
-   - Alternative: direction-parameterized accessors (more complex code)
-
-5. **Leave Value Computation**
-   - `computeLeave` allocates a new Rack for each move considered
-   - Could use mutable rack subtraction in ST context
-   - KLV lookup itself is already efficient (DAWG traversal)
 
 ### Low Priority
 

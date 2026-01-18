@@ -7,6 +7,7 @@ module Magpie.LetterDistribution
   , defaultEnglishLD
   , ldSize
   , ldScore
+  , ldScoreEquity
   , ldCount
   , ldIsVowel
   , ldToChar
@@ -18,6 +19,7 @@ module Magpie.LetterDistribution
   ) where
 
 import Magpie.Types
+import Magpie.Equity (Equity(..))
 
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as C8
@@ -31,7 +33,8 @@ import Data.Maybe (listToMaybe)
 data LetterDistribution = LetterDistribution
   { ldName_       :: !String
   , ldSize_       :: !Int                  -- ^ Number of distinct letters (including blank)
-  , ldScores      :: !(VU.Vector Int)      -- ^ Score for each machine letter
+  , ldScores      :: !(VU.Vector Int)      -- ^ Score for each machine letter (points)
+  , ldScoresEq    :: !(VU.Vector Equity)   -- ^ Score as Equity (1000x fixed-point)
   , ldCounts      :: !(VU.Vector Int)      -- ^ Count in bag for each letter
   , ldIsVowels    :: !(VU.Vector Bool)     -- ^ Is this letter a vowel?
   , ldChars       :: !(V.Vector String)    -- ^ Human-readable form (uppercase)
@@ -44,10 +47,16 @@ data LetterDistribution = LetterDistribution
 ldSize :: LetterDistribution -> Int
 ldSize = ldSize_
 
--- | Get the score for a machine letter
+-- | Get the score for a machine letter (as points)
 {-# INLINE ldScore #-}
 ldScore :: LetterDistribution -> MachineLetter -> Int
 ldScore ld (MachineLetter ml) = ldScores ld `VU.unsafeIndex` fromIntegral (ml .&. 0x7F)
+
+-- | Get the score for a machine letter as Equity (1000x fixed-point)
+-- Pre-computed to avoid runtime conversion
+{-# INLINE ldScoreEquity #-}
+ldScoreEquity :: LetterDistribution -> MachineLetter -> Equity
+ldScoreEquity ld (MachineLetter ml) = ldScoresEq ld `VU.unsafeIndex` fromIntegral (ml .&. 0x7F)
 
 -- | Get the count in bag for a machine letter
 {-# INLINE ldCount #-}
@@ -115,7 +124,10 @@ loadLetterDistribution path = do
   let ls = filter (not . BS.null) $ C8.lines content
       entries = map parseLine ls
       n = length entries
-      scores = VU.fromList $ map (\(_, _, _, s, _) -> s) entries
+      scoresList = map (\(_, _, _, s, _) -> s) entries
+      scores = VU.fromList scoresList
+      -- Pre-compute equity scores (score * 1000)
+      scoresEq = VU.fromList $ map (\s -> Equity (fromIntegral s * 1000)) scoresList
       counts = VU.fromList $ map (\(_, _, c, _, _) -> c) entries
       vowels = VU.fromList $ map (\(_, _, _, _, v) -> v) entries
       chars = V.fromList $ map (\(u, _, _, _, _) -> u) entries
@@ -125,6 +137,7 @@ loadLetterDistribution path = do
     { ldName_ = path
     , ldSize_ = n
     , ldScores = scores
+    , ldScoresEq = scoresEq
     , ldCounts = counts
     , ldIsVowels = vowels
     , ldChars = chars
@@ -154,6 +167,9 @@ defaultEnglishLD = LetterDistribution
   , ldScores = VU.fromList
       [0, 1, 3, 3, 2, 1, 4, 2, 4, 1, 8, 5, 1, 3, 1, 1, 3, 10, 1, 1, 1, 1, 4, 4, 8, 4, 10]
       -- ?  A  B  C  D  E  F  G  H  I  J  K  L  M  N  O  P  Q   R  S  T  U  V  W  X  Y  Z
+  , ldScoresEq = VU.fromList $ map Equity
+      [0, 1000, 3000, 3000, 2000, 1000, 4000, 2000, 4000, 1000, 8000, 5000, 1000, 3000,
+       1000, 1000, 3000, 10000, 1000, 1000, 1000, 1000, 4000, 4000, 8000, 4000, 10000]
   , ldCounts = VU.fromList
       [2, 9, 2, 2, 4, 12, 2, 3, 2, 9, 1, 1, 4, 2, 6, 8, 2, 1, 6, 4, 6, 4, 2, 2, 1, 2, 1]
   , ldIsVowels = VU.fromList
