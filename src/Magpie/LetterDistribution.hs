@@ -25,7 +25,7 @@ import Data.Bits ((.&.))
 import Data.Char (toUpper)
 import qualified Data.Vector as V
 import qualified Data.Vector.Unboxed as VU
-import Data.Word (Word8)
+import Data.Maybe (listToMaybe)
 
 -- | Letter distribution configuration
 data LetterDistribution = LetterDistribution
@@ -67,8 +67,10 @@ ldTotalTiles = ldTotalTiles_
 ldToChar :: LetterDistribution -> MachineLetter -> Char
 ldToChar ld ml@(MachineLetter mlVal)
   | mlVal == 0 = '?'
-  | isBlank ml = head $ ldCharsLower ld V.! fromIntegral (mlVal .&. 0x7F)
-  | otherwise  = head $ ldChars ld V.! fromIntegral mlVal
+  | isBlank ml = safeHead '?' $ ldCharsLower ld V.! fromIntegral (mlVal .&. 0x7F)
+  | otherwise  = safeHead '?' $ ldChars ld V.! fromIntegral mlVal
+  where
+    safeHead def s = case s of { (c:_) -> c; [] -> def }
 
 -- | Convert character to machine letter
 ldFromChar :: LetterDistribution -> Char -> Maybe MachineLetter
@@ -76,7 +78,7 @@ ldFromChar ld c
   | c == '?' = Just $ MachineLetter 0
   | otherwise =
       let upper = toUpper c
-          idx = V.findIndex (\s -> not (null s) && head s == upper) (ldChars ld)
+          idx = V.findIndex (\s -> listToMaybe s == Just upper) (ldChars ld)
       in case idx of
            Just i -> Just $ MachineLetter $ fromIntegral i
            Nothing -> Nothing

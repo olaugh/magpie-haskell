@@ -49,7 +49,7 @@ import Magpie.LetterDistribution
 import qualified Data.Vector as V
 import qualified Data.Vector.Mutable as MV
 import Data.Word (Word32, Word64)
-import Data.Bits (setBit, testBit)
+import Data.Bits (setBit)
 import Control.Monad (forM_)
 import Control.Monad.ST (runST)
 
@@ -99,9 +99,7 @@ emptyBoard = standardBoard
 standardBoard :: Board
 standardBoard = Board
   { boardSquares = V.generate (boardDim * boardDim) $ \i ->
-      let r = i `div` boardDim
-          c = i `mod` boardDim
-      in emptySquare { sqBonus = standardBonuses V.! i }
+      emptySquare { sqBonus = standardBonuses V.! i }
   , boardDim_ = boardDim
   }
 
@@ -278,50 +276,6 @@ computeExtensionSetsFromTiles kwg gRoot beforeTiles afterTiles distSize =
     addBlankBit 0 = 0
     addBlankBit s = setBit s 0
 
--- | Compute cross-set for a single square (legacy, for compatibility)
-computeCrossSetForSquare :: KWG -> LetterDistribution -> Board -> Direction -> Row -> Col -> (Word64, Int)
-computeCrossSetForSquare kwg ld board dir r c =
-  let -- Get perpendicular direction
-      crossDir = otherDirection dir
-      (dr, dc) = case crossDir of
-        Horizontal -> (0, 1)
-        Vertical   -> (1, 0)
-
-      -- Find start of perpendicular word
-      findStart row col
-        | not (isOnBoard board (row - dr) (col - dc)) = (row, col)
-        | isEmpty board (row - dr) (col - dc) = (row, col)
-        | otherwise = findStart (row - dr) (col - dc)
-
-      -- Find end of perpendicular word
-      findEnd row col
-        | not (isOnBoard board (row + dr) (col + dc)) = (row, col)
-        | isEmpty board (row + dr) (col + dc) = (row, col)
-        | otherwise = findEnd (row + dr) (col + dc)
-
-      (startR, startC) = findStart r c
-      (endR, endC) = findEnd r c
-
-      -- Check if there are any perpendicular tiles
-      hasPerp = (startR, startC) /= (r, c) || (endR, endC) /= (r, c)
-
-  in if not hasPerp
-     then (allLettersMask (ldSize ld), 0)  -- No perpendicular constraint
-     else
-       -- Collect letters before and after, compute valid cross letters
-       -- beforeLetters: from startR,startC to r,c (exclusive)
-       -- afterLetters: from r,c to endR+dr,endC+dc (exclusive, so includes endR,endC)
-       -- We collect the original letters (with blank bits) for scoring,
-       -- but use unblanked letters for KWG lookup
-       let beforeLetters = collectLetters board startR startC r c dr dc
-           afterLetters = collectLetters board r c (endR + dr) (endC + dc) dr dc
-           -- Score from perpendicular tiles (blanks score 0)
-           scoreML ml = if isBlank ml then 0 else ldScore ld ml
-           perpScore = sum [scoreML ml | ml <- beforeLetters ++ afterLetters]
-           -- Find which letters form valid words (need unblanked letters for KWG)
-           crossSet = computeValidLetters kwg (map unblankLetter beforeLetters) (map unblankLetter afterLetters) (ldSize ld)
-       in (crossSet, perpScore)
-
 -- | Collect letters between two positions (exclusive of end)
 -- Returns the original letters (with blank bits intact)
 collectLetters :: Board -> Row -> Col -> Row -> Col -> Int -> Int -> [MachineLetter]
@@ -391,10 +345,6 @@ getLeftExtensionSet board r c = sqLeftExtensionSet (getSquare board r c)
 getRightExtensionSet :: Board -> Row -> Col -> Word64
 getRightExtensionSet board r c = sqRightExtensionSet (getSquare board r c)
 
--- | Check if a letter is in a cross-set
-letterInCrossSet :: Word64 -> MachineLetter -> Bool
-letterInCrossSet crossSet (MachineLetter ml) = testBit crossSet (fromIntegral ml)
-
 -- | Compute anchors for the board
 -- An anchor is an empty square adjacent to a filled square
 computeAnchors :: Board -> Board
@@ -426,10 +376,6 @@ hasAdjacentTile :: Board -> Row -> Col -> Bool
 hasAdjacentTile board r c =
   any (not . isEmpty board r . (+c)) [-1, 1] ||
   any (not . flip (isEmpty board) c . (+r)) [-1, 1]
-  where
-    isEmpty' b row col
-      | isOnBoard b row col = isEmpty b row col
-      | otherwise = True
 
 -- | Check if a square is an anchor
 isAnchor :: Board -> Row -> Col -> Bool
@@ -496,7 +442,6 @@ colorCyan = "\x1b[1;36m"      -- DLS
 colorMagenta = "\x1b[1;35m"   -- DWS
 colorBlue = "\x1b[1;34m"      -- TLS
 colorRed = "\x1b[1;31m"       -- TWS
-colorGreen = "\x1b[32m"       -- On turn marker
 
 -- | Fullwidth column labels (Ａ-Ｏ)
 fullWidthCols :: [String]
@@ -585,12 +530,14 @@ loadRow ld board row str = go board 0 str
       | col >= boardDim_ b = b
       | c >= '0' && c <= '9' =
           -- Number means skip that many empty squares
-          let count = if null rest || head rest < '0' || head rest > '9'
-                      then fromEnum c - fromEnum '0'
-                      else (fromEnum c - fromEnum '0') * 10 + (fromEnum (head rest) - fromEnum '0')
-              skip = if count > 9 then 2 else 1
-              remaining = drop (skip - 1) rest
-          in go b (col + count) remaining
+          -- Check if next char is also a digit (for two-digit numbers like 15)
+          case rest of
+            (d:remaining) | d >= '0' && d <= '9' ->
+              let count = (fromEnum c - fromEnum '0') * 10 + (fromEnum d - fromEnum '0')
+              in go b (col + count) remaining
+            _ ->
+              let count = fromEnum c - fromEnum '0'
+              in go b (col + count) rest
       | otherwise =
           let ml = ldCharToML ld c
           in go (setLetter b row col ml) (col + 1) rest

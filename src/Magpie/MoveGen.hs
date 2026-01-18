@@ -41,7 +41,23 @@ defaultMoveGenConfig = MoveGenConfig
   }
 
 -- | Strip for tracking placed tiles (column -> letter)
+-- IntMap is efficient for small maps (15 elements) with O(log n) operations
 type Strip = IM.IntMap MachineLetter
+
+-- | Empty strip
+{-# INLINE emptyStrip #-}
+emptyStrip :: Strip
+emptyStrip = IM.empty
+
+-- | Insert a letter into the strip
+{-# INLINE stripInsert #-}
+stripInsert :: Int -> MachineLetter -> Strip -> Strip
+stripInsert = IM.insert
+
+-- | Get a letter from the strip
+{-# INLINE stripGet #-}
+stripGet :: Int -> Strip -> MachineLetter
+stripGet col strip = IM.findWithDefault (MachineLetter 0) col strip
 
 -- | Blank machine letter constant
 {-# INLINE blankML #-}
@@ -229,7 +245,7 @@ genMovesAtAnchor cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnchor
         Vertical -> False
   in recursiveGen cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnchorCol
                   (gaddagRoot kwg) anchorCol anchorCol anchorCol
-                  initialUniquePlay 0 1 0 0 IM.empty
+                  initialUniquePlay 0 1 0 0 emptyStrip
 
 -- | Find the actual tile placement position for a single-tile move
 -- Walks along the word direction to find the empty square where the tile is placed
@@ -325,7 +341,7 @@ processAnchors cfg kwg ld board rack rackCrossSet dir row lastAnchorCol (anchorC
                                      (gaddagRoot kwg) anchorCol  -- col = anchorCol
                                      anchorCol anchorCol  -- leftstrip = rightstrip = anchorCol
                                      initialUniquePlay 0 1 0 0  -- tilesPlayed=0
-                                     IM.empty  -- empty strip
+                                     emptyStrip  -- empty strip
 
       -- Update lastAnchorCol: if current anchor is occupied, next can start after it
       newLastAnchorCol = if not (isEmpty board row anchorCol)
@@ -379,7 +395,7 @@ recursiveGenAcc cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnchorC
            let rawLetter = unblankLetter currentLetter
                (nextNodeIdx, accepts) = getNextNodeAndAccepts kwg nodeIdx rawLetter
                -- Mark as played-through in strip
-               newStrip = IM.insert col playedThroughML strip
+               newStrip = stripInsert col playedThroughML strip
            in if nextNodeIdx == 0 && not accepts
               then acc
               else goOnAcc cfg kwg ld board rack rackCrossSet dir row anchorCol lastAnchorCol
@@ -421,7 +437,7 @@ tryAllLettersAtNodeAcc cfg kwg ld board rack rackCrossSet dir row anchorCol last
           -- Process natural tile placement
           acc1 = if canPlace && numberOfMl > 0
                  then let newRack = rackTakeLetter ml rack
-                          newStrip = IM.insert col ml strip
+                          newStrip = stripInsert col ml strip
                       in goOnAcc cfg kwg ld board newRack rackCrossSet dir row
                               anchorCol lastAnchorCol nextNodeIdx accepts
                               col ml leftstrip rightstrip uniquePlay
@@ -432,7 +448,7 @@ tryAllLettersAtNodeAcc cfg kwg ld board rack rackCrossSet dir row anchorCol last
           acc2 = if canPlace && hasBlank
                  then let newRack = rackTakeLetter blankML rack
                           blankedML = blankLetter ml  -- Blank representing this letter
-                          newStrip = IM.insert col blankedML strip
+                          newStrip = stripInsert col blankedML strip
                       in goOnAcc cfg kwg ld board newRack rackCrossSet dir row
                               anchorCol lastAnchorCol nextNodeIdx accepts
                               col blankedML leftstrip rightstrip uniquePlay
@@ -574,7 +590,7 @@ buildMove cfg _board row leftstrip rightstrip mainScore wordMult crossScore tile
       totalScore = finalMainScore + crossScore + bingoBonus
       -- Extract tiles from strip, skipping played-through markers
       tiles = [ ml | col <- [leftstrip..rightstrip]
-                   , let ml = IM.findWithDefault (MachineLetter 0) col strip
+                   , let ml = stripGet col strip
                    , ml /= playedThroughML  -- Skip played-through tiles
               ]
   in Move

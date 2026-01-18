@@ -64,7 +64,9 @@ loadKLV path = do
       (leaveBytes, _) = splitAt (fromIntegral numLeaves * 4) rest3
       leaveFloats = bytesToFloats leaveBytes
       -- Convert floats to fixed-point Int32 (1000x resolution)
-      leaveValues = VU.fromList $ map (round . (* 1000) . realToFrac) leaveFloats
+      toInt32 :: Float -> Int32
+      toInt32 f = round (f * 1000)
+      leaveValues = VU.fromList $ map toInt32 leaveFloats
       -- Compute word counts
       wordCounts = computeWordCounts kwgNodes
 
@@ -104,11 +106,11 @@ bytesToFloats _ = []
 word32ToFloat :: Word32 -> Float
 word32ToFloat w =
   let sign = if testBit w 31 then -1 else 1
-      exponent = fromIntegral ((w `shiftR` 23) .&. 0xFF) - 127 :: Int
+      exp' = fromIntegral ((w `shiftR` 23) .&. 0xFF) - 127 :: Int
       mantissa = fromIntegral (w .&. 0x7FFFFF) / 8388608.0 + 1.0
-  in if exponent == -127
+  in if exp' == -127
      then 0.0  -- Denormalized or zero
-     else sign * mantissa * (2.0 ** fromIntegral exponent)
+     else sign * mantissa * (2.0 ** fromIntegral exp')
 
 -- | Compute word counts for each node in the KWG
 -- This is used for efficient leave index computation
@@ -273,7 +275,3 @@ followArc klv nodeIdx wordIdx
       let node = klvKWGNodes klv VU.! fromIntegral nodeIdx
           arcIdx = nodeArcIndex node
       in (arcIdx, wordIdx + 1)
-
--- | Get total letters in rack
-rackTotalLetters :: Rack -> Int
-rackTotalLetters rack = rackTotal_ rack
