@@ -4,8 +4,9 @@
 module Main where
 
 import Magpie
-import Magpie.Autoplay
+import Magpie.Autoplay (AutoplayConfig(..), defaultAutoplayConfig, runAutoplayThreaded, runMoveGenComparison)
 import Magpie.KLV (KLV, loadKLV)
+import Magpie.WMP (WMP, loadWMP)
 
 import System.Environment (getArgs)
 import System.IO (hFlush, stdout, hSetBuffering, BufferMode(..))
@@ -54,16 +55,20 @@ runWithKWG kwgPath mldPath = do
   let klvPath = replaceExtension kwgPath "klv2"
   mKlv <- tryLoadKLV klvPath
 
+  -- Load WMP file at startup (same base name as KWG with .wmp extension)
+  let wmpPath = replaceExtension kwgPath "wmp"
+  mWmp <- tryLoadWMP wmpPath
+
   putStrLn $ "Loaded " ++ show (numNodes kwg) ++ " nodes"
   putStrLn ""
   putStrLn "Commands: gen <rack>, play, autoplay [n] [-t threads] [-s seed], anagram <rack>, quit"
   putStrLn ""
 
   hSetBuffering stdout LineBuffering
-  repl kwgPath kwg ld mKlv
+  repl kwgPath kwg ld mKlv mWmp
 
-repl :: FilePath -> KWG -> LetterDistribution -> Maybe KLV -> IO ()
-repl kwgPath kwg ld mKlv = do
+repl :: FilePath -> KWG -> LetterDistribution -> Maybe KLV -> Maybe WMP -> IO ()
+repl kwgPath kwg ld mKlv mWmp = do
   putStr "magpie> "
   hFlush stdout
   input <- getLine
@@ -74,21 +79,28 @@ repl kwgPath kwg ld mKlv = do
     ["exit"] -> putStrLn "Goodbye!"
     ("gen":rack:_) -> do
       generateForRack kwg ld (map toUpper rack)
-      repl kwgPath kwg ld mKlv
+      repl kwgPath kwg ld mKlv mWmp
     ("anagram":rack:_) -> do
       findAnagramsCmd kwg ld (map toUpper rack)
-      repl kwgPath kwg ld mKlv
+      repl kwgPath kwg ld mKlv mWmp
     ["play"] -> do
       playGame kwg ld
-      repl kwgPath kwg ld mKlv
+      repl kwgPath kwg ld mKlv mWmp
     ("autoplay":args') -> do
-      let config = parseAutoplayArgs mKlv args'
+      let config = parseAutoplayArgs mKlv mWmp args'
       _ <- runAutoplayThreaded kwg ld config
-      repl kwgPath kwg ld mKlv
-    [] -> repl kwgPath kwg ld mKlv
+      repl kwgPath kwg ld mKlv mWmp
+    ("compare":args') -> do
+      case mWmp of
+        Nothing -> putStrLn "Error: WMP file required for comparison. Load with a .wmp file."
+        Just wmp -> do
+          let (numGames, seed) = parseCompareArgs args'
+          runMoveGenComparison kwg ld mKlv wmp numGames seed
+      repl kwgPath kwg ld mKlv mWmp
+    [] -> repl kwgPath kwg ld mKlv mWmp
     _ -> do
       putStrLn "Unknown command. Try: gen <rack>, play, anagram <rack>, quit"
-      repl kwgPath kwg ld mKlv
+      repl kwgPath kwg ld mKlv mWmp
 
 -- | Generate moves for a rack on an empty board
 generateForRack :: KWG -> LetterDistribution -> String -> IO ()
@@ -119,30 +131,44 @@ printMove ld move =
           tiles = ldToString ld (moveTiles move)
       putStrLn $ "  " ++ pos ++ dirStr ++ " " ++ tiles ++ " (" ++ show (moveScore move) ++ ")"
 
--- | Parse autoplay arguments: [n] [-t threads] [-s seed] [-v] [--no-klv]
--- Uses the pre-loaded KLV unless --no-klv is specified
-parseAutoplayArgs :: Maybe KLV -> [String] -> AutoplayConfig
-parseAutoplayArgs mKlv args =
-  let (config, useKlv) = parseArgs defaultAutoplayConfig True args
-  in if useKlv
-     then config { autoplayKLV = mKlv }
-     else config
+-- | Parse autoplay arguments: [n] [-t threads] [-s seed] [-v] [--no-klv] [--no-wmp]
+-- Uses the pre-loaded KLV and WMP unless --no-klv or --no-wmp is specified
+parseAutoplayArgs :: Maybe KLV -> Maybe WMP -> [String] -> AutoplayConfig
+parseAutoplayArgs mKlv mWmp args =
+  let (config, useKlv, useWmp) = parseArgs defaultAutoplayConfig True True args
+      config' = if useKlv then config { autoplayKLV = mKlv } else config
+  in if useWmp then config' { autoplayWMP = mWmp } else config'
   where
-    parseArgs config useKlv [] = (config, useKlv)
-    parseArgs config useKlv ("-t":tStr:rest) =
+    parseArgs config useKlv useWmp [] = (config, useKlv, useWmp)
+    parseArgs config useKlv useWmp ("-t":tStr:rest) =
       case readMaybe tStr of
-        Just t -> parseArgs (config { autoplayNumThreads = t }) useKlv rest
-        Nothing -> parseArgs config useKlv rest
-    parseArgs config useKlv ("-s":sStr:rest) =
+        Just t -> parseArgs (config { autoplayNumThreads = t }) useKlv useWmp rest
+        Nothing -> parseArgs config useKlv useWmp rest
+    parseArgs config useKlv useWmp ("-s":sStr:rest) =
       case readMaybe sStr of
-        Just s -> parseArgs (config { autoplaySeed = s }) useKlv rest
-        Nothing -> parseArgs config useKlv rest
-    parseArgs config useKlv ("-v":rest) = parseArgs (config { autoplayVerbose = True }) useKlv rest
-    parseArgs config _ ("--no-klv":rest) = parseArgs config False rest
-    parseArgs config useKlv (nStr:rest) =
+        Just s -> parseArgs (config { autoplaySeed = s }) useKlv useWmp rest
+        Nothing -> parseArgs config useKlv useWmp rest
+    parseArgs config useKlv useWmp ("-v":rest) = parseArgs (config { autoplayVerbose = True }) useKlv useWmp rest
+    parseArgs config _ useWmp ("--no-klv":rest) = parseArgs config False useWmp rest
+    parseArgs config useKlv _ ("--no-wmp":rest) = parseArgs config useKlv False rest
+    parseArgs config useKlv useWmp (nStr:rest) =
       case readMaybe nStr of
-        Just n -> parseArgs (config { autoplayNumGames = n }) useKlv rest
-        Nothing -> parseArgs config useKlv rest
+        Just n -> parseArgs (config { autoplayNumGames = n }) useKlv useWmp rest
+        Nothing -> parseArgs config useKlv useWmp rest
+
+-- | Parse compare arguments: [n] [-s seed]
+parseCompareArgs :: [String] -> (Int, Int)
+parseCompareArgs = go 10 0  -- defaults: 10 games, seed 0
+  where
+    go numGames seed [] = (numGames, seed)
+    go numGames _ ("-s":sStr:rest) =
+      case readMaybe sStr of
+        Just s -> go numGames s rest
+        Nothing -> go numGames 0 rest
+    go _ seed (nStr:rest) =
+      case readMaybe nStr of
+        Just n -> go n seed rest
+        Nothing -> go 10 seed rest
 
 -- | Replace file extension
 replaceExtension :: FilePath -> String -> FilePath
@@ -160,6 +186,18 @@ tryLoadKLV path = do
       return (Just klv)
     Nothing -> do
       putStrLn "Note: No KLV file found, using score-only move selection"
+      return Nothing
+
+-- | Try to load a WMP file, returning Nothing on failure
+tryLoadWMP :: FilePath -> IO (Maybe WMP)
+tryLoadWMP path = do
+  result <- (Just <$> loadWMP path) `catch` (\(_ :: SomeException) -> return Nothing)
+  case result of
+    Just wmp -> do
+      putStrLn $ "Loaded word map: " ++ path
+      return (Just wmp)
+    Nothing -> do
+      putStrLn "Note: No WMP file found, WMP-based pruning disabled"
       return Nothing
 
 -- | Find anagrams command

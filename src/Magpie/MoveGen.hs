@@ -20,6 +20,8 @@ import Magpie.KLV (KLV, klvGetLeaveValueFromTiles)
 import Magpie.Board
 import Magpie.LetterDistribution
 import Magpie.Shadow (generateAnchors, Anchor(..), ShadowConfig(..), defaultShadowConfig)
+import Magpie.WMP (WMP)
+import Magpie.WMPMoveGen
 
 import Data.Word (Word8, Word32, Word64)
 import Data.Int (Int32)
@@ -124,13 +126,17 @@ generateMovesWithScores cfg kwg ld board rack =
 -- 1. Uses shadow pruning to skip anchors that can't beat current best
 -- 2. Uses ST monad with mutable vectors for O(1) rack/strip operations
 -- 3. Never builds lists of moves - only tracks the best move found
+-- 4. Uses WMP (if provided) for fast word existence checking
 --
 -- If a KLV is provided, moves are compared by equity (score + leave value).
 -- Otherwise, moves are compared by score only.
 --
+-- If a WMP is provided, it is used to quickly check if words exist before
+-- doing full GADDAG traversal (shadow pruning optimization).
+--
 -- bagCount: number of tiles remaining in the bag (exchanges require >= 7)
-generateBestMove :: MoveGenConfig -> Maybe KLV -> KWG -> LetterDistribution -> Board -> Rack -> Int -> Move
-generateBestMove cfg mKlv kwg ld board rack bagCount =
+generateBestMove :: MoveGenConfig -> Maybe KLV -> Maybe WMP -> KWG -> LetterDistribution -> Board -> Rack -> Int -> Move
+generateBestMove cfg mKlv mWmp kwg ld board rack bagCount =
   let rackCrossSet = computeRackCrossSet rack (ldSize ld)
       distSize = ldSize ld
 
@@ -145,6 +151,17 @@ generateBestMove cfg mKlv kwg ld board rack bagCount =
       -- Generate shadow anchors (sorted by highest possible equity descending)
       shadowCfg = defaultShadowConfig { shadowBingoBonus = mgcBingoBonus cfg }
       anchors = generateAnchors shadowCfg kwg ld board rack
+
+      -- Only initialize WMP for opening move (empty board)
+      -- For mid-game, WMP pruning isn't implemented yet, so skip the overhead
+      boardIsEmptyTopLevel = getTilesPlayed board == 0
+      wmg = if boardIsEmptyTopLevel
+            then let wmgBase = wmpMoveGenInit mWmp rack
+                 in if wmpMoveGenIsActive wmgBase
+                    then wmpMoveGenCheckNonplaythroughExistence False (const (Equity 0)) $
+                         wmpMoveGenResetPlaythrough wmgBase
+                    else wmgBase
+            else wmpMoveGenInit Nothing rack  -- Skip WMP for mid-game
 
       -- Process anchors in order, stopping when we can't beat the best
       passMove = Move Pass 0 0 Horizontal [] 0 0 (Equity 0)
@@ -190,6 +207,13 @@ generateBestMove cfg mKlv kwg ld board rack bagCount =
         Nothing -> 0
         Just _  -> 75000
 
+      -- Check if a word of given length exists (using WMP if available)
+      wordLengthExists :: Int -> Bool
+      wordLengthExists len =
+        if wmpMoveGenIsActive wmg
+        then wmpMoveGenNonplaythroughWordOfLengthExists len wmg
+        else True  -- If no WMP, assume words exist (fall through to GADDAG)
+
       -- Run the entire anchor loop in a single ST computation
       -- This avoids re-allocating mutable state for each anchor
   in runST $ do
@@ -221,10 +245,19 @@ generateBestMove cfg mKlv kwg ld board rack bagCount =
                     Horizontal -> True
                     Vertical   -> False
 
-              recursiveGenBestSTDir cfg mKlv rack maxLeaveValue kwg ld boardForDir rackM rackCrossSet
-                                    dir genRow genAncCol genLastAncCol
-                                    (gaddagRoot kwg) genAncCol genAncCol genAncCol
-                                    initialUniquePlay 0 1 0 0 distSize strip bestRef
+                  -- WMP existence check: only active for opening move (empty board)
+                  -- wmg is only active when board is empty (set above)
+                  rackSize' = rackTotal_ rack
+                  minWordLen = max minimumWordLength (rackSize' - 6)  -- At least 2, or rack-6
+                  maxWordLen = rackSize'
+                  anyWordExists = any wordLengthExists [minWordLen..maxWordLen]
+
+              -- Skip this anchor if WMP says no words exist (only affects empty board)
+              when anyWordExists $
+                recursiveGenBestSTDir cfg mKlv rack maxLeaveValue kwg ld boardForDir rackM rackCrossSet
+                                      dir genRow genAncCol genLastAncCol
+                                      (gaddagRoot kwg) genAncCol genAncCol genAncCol
+                                      initialUniquePlay 0 1 0 0 distSize strip bestRef
 
               loop rest
 

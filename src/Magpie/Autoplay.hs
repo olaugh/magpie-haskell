@@ -7,21 +7,25 @@ module Magpie.Autoplay
   , AutoplayResults(..)
   , defaultAutoplayConfig
   , runAutoplayThreaded
+  , runMoveGenComparison
   ) where
 
 import Magpie.Types
 import Magpie.LetterDistribution
 import Magpie.KWG
 import Magpie.KLV (KLV)
+import Magpie.WMP (WMP)
 import Magpie.MoveGen (generateBestMove, defaultMoveGenConfig)
+import Magpie.Board (getTilesPlayed)
 import Magpie.Game
 
 import Control.Concurrent
 import Control.Concurrent.STM
 import Control.Monad (replicateM, forM_, when)
-import System.Random (StdGen, mkStdGen)
+import System.Random (StdGen, mkStdGen, newStdGen)
 import Text.Printf (printf)
 import Data.Time.Clock (getCurrentTime, diffUTCTime)
+import qualified Data.Vector.Unboxed as VU
 
 -- | Configuration for autoplay
 data AutoplayConfig = AutoplayConfig
@@ -30,6 +34,7 @@ data AutoplayConfig = AutoplayConfig
   , autoplaySeed        :: !Int        -- ^ Random seed for reproducibility
   , autoplayVerbose     :: !Bool       -- ^ Show individual game results
   , autoplayKLV         :: !(Maybe KLV) -- ^ Leave values for equity-based move selection
+  , autoplayWMP         :: !(Maybe WMP) -- ^ Word Map for fast word existence checking
   } deriving (Show)
 
 -- | Default autoplay configuration
@@ -40,6 +45,7 @@ defaultAutoplayConfig = AutoplayConfig
   , autoplaySeed       = 0
   , autoplayVerbose    = False
   , autoplayKLV        = Nothing
+  , autoplayWMP        = Nothing
   }
 
 -- | Aggregated results from all autoplay games
@@ -253,8 +259,8 @@ workerThread kwg ld AutoplayConfig{..} SharedState{..} _ = loop
           -- Create deterministic RNG for this game
           let gen = mkStdGen (autoplaySeed + gameNum)
 
-          -- Play the game (pass KLV for equity-based move selection)
-          result <- playOneGame autoplayKLV kwg ld gen
+          -- Play the game (pass KLV and WMP for equity-based move selection)
+          result <- playOneGame autoplayKLV autoplayWMP kwg ld gen
 
           -- Aggregate result
           atomically $ do
@@ -265,8 +271,8 @@ workerThread kwg ld AutoplayConfig{..} SharedState{..} _ = loop
           loop
 
 -- | Play a single game and return the result
-playOneGame :: Maybe KLV -> KWG -> LetterDistribution -> StdGen -> IO SingleGameResult
-playOneGame mKlv kwg ld gen0 = do
+playOneGame :: Maybe KLV -> Maybe WMP -> KWG -> LetterDistribution -> StdGen -> IO SingleGameResult
+playOneGame mKlv mWmp kwg ld gen0 = do
   let (game0, gen1) = newGame ld kwg gen0
   go game0 gen1 0 0 0 0 0 0 0 0 0 0 0
   where
@@ -288,8 +294,8 @@ playOneGame mKlv kwg ld gen0 = do
               board = gameBoard game
               bagCount = rackTotal (gameBag game)
 
-              -- Generate the best move using shadow pruning and leave values (if KLV provided)
-              bestMove = generateBestMove defaultMoveGenConfig mKlv kwg ld board rack bagCount
+              -- Generate the best move using shadow pruning, WMP existence checking, and leave values
+              bestMove = generateBestMove defaultMoveGenConfig mKlv mWmp kwg ld board rack bagCount
 
               (game', gen') = makeMove game bestMove gen
 
@@ -314,3 +320,75 @@ playOneGame mKlv kwg ld gen0 = do
               newP2Score = if not isP1 then p2Score + moveScore bestMove else p2Score
 
           go game' gen' (turns + 1) newP1Score newP2Score newP1Tiles newP2Tiles newP1Bingos newP2Bingos newP1Exchanges newP2Exchanges newP1Passes newP2Passes
+
+-- | Run move generation comparison between WMP and non-WMP modes
+-- Plays games and reports any positions where the two methods choose different moves
+runMoveGenComparison :: KWG -> LetterDistribution -> Maybe KLV -> WMP -> Int -> Int -> IO ()
+runMoveGenComparison kwg ld mKlv wmp numGames seed = do
+  putStrLn "Running move generation comparison (WMP vs non-WMP)..."
+  putStrLn ""
+  go 0 0 (mkStdGen seed)
+  where
+    go !gameNum !totalDiffs !gen
+      | gameNum >= numGames = do
+          putStrLn ""
+          putStrLn $ "Comparison complete: " ++ show numGames ++ " games, " ++
+                     show totalDiffs ++ " move differences found"
+      | otherwise = do
+          let (game0, gen') = newGame ld kwg gen
+          diffs <- playComparisonGame mKlv wmp kwg ld game0 gameNum 0
+          when (diffs > 0) $
+            putStrLn $ "Game " ++ show gameNum ++ ": " ++ show diffs ++ " differences"
+          go (gameNum + 1) (totalDiffs + diffs) gen'
+
+-- | Play a single game comparing WMP and non-WMP move generation
+playComparisonGame :: Maybe KLV -> WMP -> KWG -> LetterDistribution -> Game -> Int -> Int -> IO Int
+playComparisonGame mKlv wmp kwg ld game gameNum turnNum
+  | isGameOver game = return 0
+  | otherwise = do
+      let player = currentPlayer game
+          rack = playerRack player
+          board = gameBoard game
+          bagCount = rackTotal (gameBag game)
+
+          -- Generate move WITHOUT WMP
+          moveNoWmp = generateBestMove defaultMoveGenConfig mKlv Nothing kwg ld board rack bagCount
+
+          -- Generate move WITH WMP
+          moveWithWmp = generateBestMove defaultMoveGenConfig mKlv (Just wmp) kwg ld board rack bagCount
+
+          -- Compare moves
+          isDifferent = moveScore moveNoWmp /= moveScore moveWithWmp ||
+                        moveType moveNoWmp /= moveType moveWithWmp ||
+                        moveTiles moveNoWmp /= moveTiles moveWithWmp
+
+      diffCount <- if isDifferent
+        then do
+          putStrLn ""
+          putStrLn $ "=== DIFFERENCE at game " ++ show gameNum ++ ", turn " ++ show turnNum ++ " ==="
+          putStrLn $ "Rack: " ++ ldToString ld (rackToList rack)
+          putStrLn $ "Board tiles played: " ++ show (getTilesPlayed board)
+          putStrLn $ "Bag count: " ++ show bagCount
+          putStrLn ""
+          putStrLn $ "Non-WMP move: " ++ showMoveCompact ld moveNoWmp
+          putStrLn $ "WMP move:     " ++ showMoveCompact ld moveWithWmp
+          putStrLn $ "Score diff: " ++ show (moveScore moveNoWmp - moveScore moveWithWmp)
+          return 1
+        else return 0
+
+      -- Continue game using the non-WMP move (the correct one)
+      gen <- newStdGen
+      let (game', _) = makeMove game moveNoWmp gen
+      restDiffs <- playComparisonGame mKlv wmp kwg ld game' gameNum (turnNum + 1)
+      return (diffCount + restDiffs)
+
+-- | Show a move in compact format
+showMoveCompact :: LetterDistribution -> Move -> String
+showMoveCompact ld m = case moveType m of
+  Pass -> "PASS (score=" ++ show (moveScore m) ++ ")"
+  Exchange -> "EXCH " ++ ldToString ld (moveTiles m) ++ " (score=" ++ show (moveScore m) ++ ")"
+  TilePlacement ->
+    let pos = [toEnum (fromEnum 'A' + moveCol m)] ++ show (moveRow m + 1)
+        dirStr = case moveDir m of { Horizontal -> ""; Vertical -> "v" }
+    in pos ++ dirStr ++ " " ++ ldToString ld (moveTiles m) ++ " (score=" ++ show (moveScore m) ++ ")"
+
