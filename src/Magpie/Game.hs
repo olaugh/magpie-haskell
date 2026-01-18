@@ -350,6 +350,7 @@ autoplay initialGame initialGen verbose = go initialGame initialGen 0 []
     when False _ = return ()
 
 -- | Simple move display
+-- Playthrough tiles (MachineLetter 0) are shown as '.'
 showMoveSimple :: LetterDistribution -> Move -> String
 showMoveSimple ld move =
   case moveType move of
@@ -360,5 +361,6 @@ showMoveSimple ld move =
           dirStr = case moveDir move of
             Horizontal -> ""
             Vertical -> " (down)"
-          tiles = ldToString ld (filter (\ml -> unML ml /= 0) (moveTiles move))
-      in pos ++ dirStr ++ " " ++ tiles ++ " " ++ show (moveScore move)
+          tilesStr = map mlToChar (moveTiles move)
+          mlToChar ml = if unML ml == 0 then '.' else ldToChar ld ml
+      in pos ++ dirStr ++ " " ++ tilesStr ++ " " ++ show (moveScore move)

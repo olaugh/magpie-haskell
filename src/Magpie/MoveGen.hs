@@ -78,7 +78,7 @@ playedThroughML = MachineLetter 0xFF
 -- | Generate all valid moves for a rack on a board
 generateMoves :: KWG -> LetterDistribution -> Board -> Rack -> [Move]
 generateMoves kwg ld board rack =
-  sortBy (comparing (Down . moveScore)) $
+  sortBy (flip compareMove) $  -- flip for descending order (best first)
     generateMovesWithScores defaultMoveGenConfig kwg ld board rack
 
 -- | Generate moves with scoring
@@ -148,20 +148,18 @@ generateBestMove cfg mKlv mWmp kwg ld board rack bagCount =
       transBoard = transpose board
       boardVTrans = computeAnchors $ computeCrossSets kwg ld Horizontal transBoard
 
-      -- Generate shadow anchors (sorted by highest possible equity descending)
-      shadowCfg = defaultShadowConfig { shadowBingoBonus = mgcBingoBonus cfg }
-      anchors = generateAnchors shadowCfg kwg ld board rack
+      -- Initialize WMP move gen for shadow pruning
+      -- Compute nonplaythrough existence once at the beginning
+      wmgBase = wmpMoveGenInit mWmp rack
+      wmg = if wmpMoveGenIsActive wmgBase
+            then wmpMoveGenCheckNonplaythroughExistence False (const (Equity 0)) $
+                 wmpMoveGenResetPlaythrough wmgBase
+            else wmgBase
 
-      -- Only initialize WMP for opening move (empty board)
-      -- For mid-game, WMP pruning isn't implemented yet, so skip the overhead
-      boardIsEmptyTopLevel = getTilesPlayed board == 0
-      wmg = if boardIsEmptyTopLevel
-            then let wmgBase = wmpMoveGenInit mWmp rack
-                 in if wmpMoveGenIsActive wmgBase
-                    then wmpMoveGenCheckNonplaythroughExistence False (const (Equity 0)) $
-                         wmpMoveGenResetPlaythrough wmgBase
-                    else wmgBase
-            else wmpMoveGenInit Nothing rack  -- Skip WMP for mid-game
+      -- Generate shadow anchors (sorted by highest possible equity descending)
+      -- WMP is used for word existence checking in shadow pruning
+      shadowCfg = defaultShadowConfig { shadowBingoBonus = mgcBingoBonus cfg }
+      anchors = generateAnchors shadowCfg kwg ld board rack wmg
 
       -- Process anchors in order, stopping when we can't beat the best
       passMove = Move Pass 0 0 Horizontal [] 0 0 (Equity 0)
@@ -207,12 +205,14 @@ generateBestMove cfg mKlv mWmp kwg ld board rack bagCount =
         Nothing -> 0
         Just _  -> 75000
 
-      -- Check if a word of given length exists (using WMP if available)
+      -- Check if a nonplaythrough word of given length exists (using WMP if available)
+      -- This is only valid for empty boards where all moves are nonplaythrough
+      boardIsEmpty = getTilesPlayed board == 0
       wordLengthExists :: Int -> Bool
       wordLengthExists len =
-        if wmpMoveGenIsActive wmg
+        if wmpMoveGenIsActive wmg && boardIsEmpty
         then wmpMoveGenNonplaythroughWordOfLengthExists len wmg
-        else True  -- If no WMP, assume words exist (fall through to GADDAG)
+        else True  -- If no WMP or mid-game, assume words exist (fall through to GADDAG)
 
       -- Run the entire anchor loop in a single ST computation
       -- This avoids re-allocating mutable state for each anchor
@@ -245,14 +245,14 @@ generateBestMove cfg mKlv mWmp kwg ld board rack bagCount =
                     Horizontal -> True
                     Vertical   -> False
 
-                  -- WMP existence check: only active for opening move (empty board)
-                  -- wmg is only active when board is empty (set above)
+                  -- WMP existence check: for empty board, check if any word lengths exist
+                  -- For mid-game, shadow pruning handles WMP existence checking
                   rackSize' = rackTotal_ rack
                   minWordLen = max minimumWordLength (rackSize' - 6)  -- At least 2, or rack-6
                   maxWordLen = rackSize'
                   anyWordExists = any wordLengthExists [minWordLen..maxWordLen]
 
-              -- Skip this anchor if WMP says no words exist (only affects empty board)
+              -- Skip this anchor if WMP says no nonplaythrough words exist (empty board only)
               when anyWordExists $
                 recursiveGenBestSTDir cfg mKlv rack maxLeaveValue kwg ld boardForDir rackM rackCrossSet
                                       dir genRow genAncCol genLastAncCol
@@ -797,28 +797,29 @@ tryRecordMove cfg mKlv origRack maxLeaveVal bestRef dir row leftstrip rightstrip
       totalScore = finalMainScore + crossScore + bingoBonus
       -- Max possible equity for this move
       maxPossibleEquity = Equity (fromIntegral totalScore * 1000 + maxLeaveVal)
-  (_, currentBest) <- readSTRef bestRef
+  (currentBestMove, currentBest) <- readSTRef bestRef
   -- Only build the full move if it might beat current best
-  when (maxPossibleEquity > currentBest) $ do
+  when (maxPossibleEquity >= currentBest) $ do
     tiles <- extractTilesST strip leftstrip rightstrip
     let leaveVal = case mKlv of
           Just klv -> klvGetLeaveValueFromTiles klv origRack tiles
           Nothing  -> 0
         equity = Equity (fromIntegral totalScore * 1000 + leaveVal)
-    when (equity > currentBest) $ do
-      let (outRow, outCol) = case dir of
-            Horizontal -> (row, leftstrip)
-            Vertical   -> (leftstrip, row)
-          move = Move
-            { moveType = TilePlacement
-            , moveRow = outRow
-            , moveCol = outCol
-            , moveDir = dir
-            , moveTiles = tiles
-            , moveTilesUsed = tilesUsed
-            , moveScore = totalScore
-            , moveEquity = equity
-            }
+        (outRow, outCol) = case dir of
+          Horizontal -> (row, leftstrip)
+          Vertical   -> (leftstrip, row)
+        move = Move
+          { moveType = TilePlacement
+          , moveRow = outRow
+          , moveCol = outCol
+          , moveDir = dir
+          , moveTiles = tiles
+          , moveTilesUsed = tilesUsed
+          , moveScore = totalScore
+          , moveEquity = equity
+          }
+    -- Use compareMove for proper tie-breaking (GT means new move is better)
+    when (compareMove move currentBestMove == GT) $
       writeSTRef bestRef (move, equity)
 
 -- | Extract tiles from mutable strip

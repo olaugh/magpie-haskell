@@ -383,6 +383,7 @@ playComparisonGame mKlv wmp kwg ld game gameNum turnNum
       return (diffCount + restDiffs)
 
 -- | Show a move in compact format
+-- Playthrough tiles (MachineLetter 0) are shown as '.'
 showMoveCompact :: LetterDistribution -> Move -> String
 showMoveCompact ld m = case moveType m of
   Pass -> "PASS (score=" ++ show (moveScore m) ++ ")"
@@ -390,5 +391,7 @@ showMoveCompact ld m = case moveType m of
   TilePlacement ->
     let pos = [toEnum (fromEnum 'A' + moveCol m)] ++ show (moveRow m + 1)
         dirStr = case moveDir m of { Horizontal -> ""; Vertical -> "v" }
-    in pos ++ dirStr ++ " " ++ ldToString ld (moveTiles m) ++ " (score=" ++ show (moveScore m) ++ ")"
+        tilesStr = map mlToChar (moveTiles m)
+        mlToChar ml = if unML ml == 0 then '.' else ldToChar ld ml
+    in pos ++ dirStr ++ " " ++ tilesStr ++ " (score=" ++ show (moveScore m) ++ ")"
 

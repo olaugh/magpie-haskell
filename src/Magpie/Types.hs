@@ -44,6 +44,7 @@ module Magpie.Types
     -- * Move
   , Move(..)
   , MoveType(..)
+  , compareMove
 
     -- * Equity (re-exported from Magpie.Equity)
   , Equity(..)
@@ -253,3 +254,37 @@ data Move = Move
   , moveScore      :: !Int
   , moveEquity     :: !Equity           -- ^ Score + leave value
   } deriving (Eq, Show, Generic)
+
+-- | Compare two moves for sorting (matches MAGPIE's compare_moves)
+-- Returns GT if move1 is better, LT if move2 is better, EQ if equivalent
+-- Comparison order (for tie-breaking):
+-- 1. Higher equity wins
+-- 2. Higher score wins
+-- 3. Lower moveType wins (TilePlacement < Exchange < Pass)
+-- 4. Lower row wins
+-- 5. Lower col wins
+-- 6. Horizontal direction wins over Vertical
+-- 7. Fewer tiles used wins
+-- 8. Shorter tiles length wins
+-- 9. Lexicographically smaller tiles wins
+compareMove :: Move -> Move -> Ordering
+compareMove m1 m2
+  -- Higher equity is better
+  | moveEquity m1 /= moveEquity m2 = compare (moveEquity m1) (moveEquity m2)
+  -- Higher score is better
+  | moveScore m1 /= moveScore m2 = compare (moveScore m1) (moveScore m2)
+  -- Lower move type is better (TilePlacement < Exchange < Pass)
+  | moveType m1 /= moveType m2 = compare (moveType m2) (moveType m1)
+  -- Lower row is better
+  | moveRow m1 /= moveRow m2 = compare (moveRow m2) (moveRow m1)
+  -- Lower col is better
+  | moveCol m1 /= moveCol m2 = compare (moveCol m2) (moveCol m1)
+  -- Horizontal is better than Vertical
+  | moveDir m1 /= moveDir m2 = compare (moveDir m2) (moveDir m1)
+  -- Fewer tiles used is better
+  | moveTilesUsed m1 /= moveTilesUsed m2 = compare (moveTilesUsed m2) (moveTilesUsed m1)
+  -- Shorter tiles is better
+  | length (moveTiles m1) /= length (moveTiles m2) = compare (length (moveTiles m2)) (length (moveTiles m1))
+  -- Lexicographically smaller tiles wins
+  | moveTiles m1 /= moveTiles m2 = compare (moveTiles m2) (moveTiles m1)
+  | otherwise = EQ
