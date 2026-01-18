@@ -50,15 +50,15 @@ main = do
       let sortedByEquity = sortBy (comparing (\(_, _, _, eq) -> Down eq)) movesWithEquity
       mapM_ printMoveEquity (take 20 sortedByEquity)
 
-      -- Test generateBestMove
+      -- Test generateBestMove (use 100 for bagCount - full bag)
       putStrLn ""
       putStrLn "Best move by score (no KLV):"
-      let bestNoKlv = generateBestMove defaultMoveGenConfig Nothing kwg ld board rack
+      let bestNoKlv = generateBestMove defaultMoveGenConfig Nothing kwg ld board rack 100
       putStrLn $ "  " ++ showMove ld bestNoKlv ++ " score=" ++ show (moveScore bestNoKlv)
 
       putStrLn ""
       putStrLn "Best move by equity (with KLV):"
-      let bestWithKlv = generateBestMove defaultMoveGenConfig (Just klv) kwg ld board rack
+      let bestWithKlv = generateBestMove defaultMoveGenConfig (Just klv) kwg ld board rack 100
       putStrLn $ "  " ++ showMove ld bestWithKlv ++ " score=" ++ show (moveScore bestWithKlv) ++
                  " equity=" ++ show (moveEquity bestWithKlv)
   where
