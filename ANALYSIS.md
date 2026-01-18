@@ -219,7 +219,7 @@ The Haskell implementation is a faithful port of MAGPIE's algorithms, but uses i
 - Best-move-only tracking to avoid Move list allocation
 - Shadow pruning with equity comparison
 - **Pre-computed Equity scores in LetterDistribution** (`ldScoresEq` field, `ldScoreEquity` accessor)
-- **Direction-aware board accessors** (`getLetterDir`, `getCrossSetDir`, etc.) to eliminate board transpose
+- **Board transpose for vertical moves** - columns become rows for cache-friendly access during generation
 - **Efficient leave value computation** using `klvGetLeaveValueFromTiles` instead of allocating intermediate Rack
 
 ---

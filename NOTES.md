@@ -39,9 +39,9 @@ The core move generation engine is functional and produces correct results:
    - Avoids repeated `fromIntegral * 1000` conversions in hot path
 
 3. **Vertical Move Generation** ✓
-   - Implemented direction-aware board accessors (`getLetterDir`, `getCrossSetDir`, etc.)
-   - Unified `recursiveGenBestSTDir` handles both directions without board transpose
-   - Eliminates O(n²) board copy for vertical moves
+   - Uses board transpose so columns become rows (cache-friendly iteration)
+   - Unified `recursiveGenBestSTDir` handles both directions with consistent accessors
+   - Direction parameter used only for output coordinate transformation
 
 4. **Leave Value Computation** ✓
    - Using `klvGetLeaveValueFromTiles` which computes leave value directly from tiles

@@ -137,8 +137,10 @@ generateBestMove cfg mKlv kwg ld board rack bagCount =
       -- Prepare boards for both directions (pre-compute cross-sets once)
       -- Cross-sets for Horizontal moves (checking Vertical perpendiculars)
       boardH = computeAnchors $ computeCrossSets kwg ld Horizontal board
-      -- Cross-sets for Vertical moves (checking Horizontal perpendiculars)
-      boardV = computeAnchors $ computeCrossSets kwg ld Vertical board
+      -- For Vertical moves: transpose board so columns become rows (cache-friendly)
+      -- Then compute cross-sets as if Horizontal on the transposed board
+      transBoard = transpose board
+      boardVTrans = computeAnchors $ computeCrossSets kwg ld Horizontal transBoard
 
       -- Generate shadow anchors (sorted by highest possible equity descending)
       shadowCfg = defaultShadowConfig { shadowBingoBonus = mgcBingoBonus cfg }
@@ -214,7 +216,7 @@ generateBestMove cfg mKlv kwg ld board rack bagCount =
                     Vertical   -> (ancCol, ancRow, lastAnchorCol)
                   boardForDir = case dir of
                     Horizontal -> boardH
-                    Vertical   -> boardV
+                    Vertical   -> boardVTrans
                   initialUniquePlay = case dir of
                     Horizontal -> True
                     Vertical   -> False
@@ -800,10 +802,9 @@ extractTilesST strip leftstrip rightstrip = go leftstrip []
             else go (col + 1) (ml : acc)
 
 -- | ST-based recursive generation that only tracks the best move
--- Uses direction-aware accessors to avoid board transpose for vertical moves
--- For Horizontal: row = actual row, col = column position
--- For Vertical: row = actual column (line of travel), col = row position
--- The direction-aware accessors handle the coordinate mapping
+-- For Horizontal: uses board directly
+-- For Vertical: uses transposed board (columns become rows for cache locality)
+-- The dir parameter is used for output coordinate transformation in tryRecordMove
 recursiveGenBestSTDir :: MoveGenConfig -> Maybe KLV -> Rack -> Int32 -> KWG -> LetterDistribution -> Board
                       -> MRackCounts s -> Word64 -> Direction -> Int -> Int -> Int -> Word32
                       -> Int -> Int -> Int -> Bool -> Int -> Int -> Int -> Int
@@ -823,9 +824,8 @@ recursiveGenBestSTDir cfg mKlv origRack maxLeaveVal kwg ld board rackM rackCross
       | nodeIdx == 0 = return ()
       | col < 0 || col >= boardDim = return ()
       | otherwise = do
-          -- Use direction-aware accessors for board access
-          let currentLetter = getLetterDir board dir row col
-              crossSet = getCrossSetDir board dir row col
+          let currentLetter = getLetter board row col
+              crossSet = getCrossSet board row col
               possibleLettersHere = if crossSet == 1 then 0 else crossSet
 
           if unML currentLetter /= 0
@@ -878,9 +878,8 @@ recursiveGenBestSTDir cfg mKlv origRack maxLeaveVal kwg ld board rackM rackCross
 
     goOn !nodeIdx !accepts !currentCol !letterPlaced !leftstrip !rightstrip
          !uniquePlay !mainWordScore !wordMult !crossScore !tilesPlayed = do
-      -- Use direction-aware accessors for all board access
-      let squareIsEmpty = isEmptyDir board dir row currentCol
-          sq = getSquareDir board dir row currentCol
+      let squareIsEmpty = isEmpty board row currentCol
+          sq = getSquare board row currentCol
           bonus = sqBonus sq
           letterMult = if squareIsEmpty then letterMultiplier bonus else 1
           thisWordMult = if squareIsEmpty then wordMultiplier bonus else 1
@@ -889,7 +888,7 @@ recursiveGenBestSTDir cfg mKlv origRack maxLeaveVal kwg ld board rackM rackCross
           tileScore = if isBlank letterPlaced then 0 else ldScore ld ml
           scoredLetter = tileScore * letterMult
           newMainScore = mainWordScore + scoredLetter
-          crossWordBase = if squareIsEmpty then getCrossScoreDir board dir row currentCol else 0
+          crossWordBase = if squareIsEmpty then getCrossScore board row currentCol else 0
           newCrossScore = if crossWordBase > 0
                           then crossScore + (crossWordBase + scoredLetter) * thisWordMult
                           else crossScore
@@ -898,12 +897,12 @@ recursiveGenBestSTDir cfg mKlv origRack maxLeaveVal kwg ld board rackM rackCross
         then do
           let newUniquePlay = case dir of
                 Horizontal -> uniquePlay
-                Vertical -> if squareIsEmpty && getCrossSetDir board dir row currentCol == trivialCrossSet distSize
+                Vertical -> if squareIsEmpty && getCrossSet board row currentCol == trivialCrossSet distSize
                             then True
                             else uniquePlay
               newLeftstrip = currentCol
-              noLetterDirectlyLeft = currentCol == 0 || isEmptyDir board dir row (currentCol - 1)
-              noLetterRightOfAnchor = anchorCol == boardDim - 1 || isEmptyDir board dir row (anchorCol + 1)
+              noLetterDirectlyLeft = currentCol == 0 || isEmpty board row (currentCol - 1)
+              noLetterRightOfAnchor = anchorCol == boardDim - 1 || isEmpty board row (anchorCol + 1)
 
           when (accepts && noLetterDirectlyLeft && noLetterRightOfAnchor &&
                 playIsNonemptyAndNonduplicate tilesPlayed newUniquePlay) $
@@ -920,10 +919,10 @@ recursiveGenBestSTDir cfg mKlv origRack maxLeaveVal kwg ld board rackM rackCross
                    newUniquePlay newMainScore newWordMult newCrossScore tilesPlayed
         else do
           let newRightstrip = currentCol
-              noLetterDirectlyRight = currentCol == boardDim - 1 || isEmptyDir board dir row (currentCol + 1)
+              noLetterDirectlyRight = currentCol == boardDim - 1 || isEmpty board row (currentCol + 1)
               newUniquePlay = case dir of
                 Horizontal -> uniquePlay
-                Vertical -> if squareIsEmpty && not uniquePlay && getCrossSetDir board dir row currentCol == trivialCrossSet distSize
+                Vertical -> if squareIsEmpty && not uniquePlay && getCrossSet board row currentCol == trivialCrossSet distSize
                             then True
                             else uniquePlay
 
