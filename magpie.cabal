@@ -184,3 +184,13 @@ test-suite wmp-movegen-test
   default-language: Haskell2010
   ghc-options: -O2
 
+test-suite shadow-wmp-test
+  type: exitcode-stdio-1.0
+  main-is: ShadowWMPTest.hs
+  hs-source-dirs: test
+  build-depends:
+    base >= 4.14 && < 5,
+    magpie
+  default-language: Haskell2010
+  ghc-options: -O2
+

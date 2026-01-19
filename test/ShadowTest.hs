@@ -18,6 +18,7 @@ import Magpie.KWG
 import Magpie.Board
 import Magpie.LetterDistribution
 import Magpie.Shadow
+import Magpie.WMPMoveGen (wmpMoveGenInit)
 
 import System.Exit (exitFailure, exitSuccess)
 import Control.Monad (unless)
@@ -54,7 +55,8 @@ loadAndShadow kwg ld cgp rackStr =
   let board = loadCGP ld cgp
       rack = rackFromString ld rackStr
       cfg = defaultShadowConfig { shadowSortByScore = True }
-      anchors = generateAnchors cfg kwg ld board rack
+      wmg = wmpMoveGenInit Nothing rack  -- No WMP for basic tests
+      anchors = generateAnchors cfg kwg ld board rack wmg
   in extractSortedAnchors anchors
 
 -- | Test that anchors are generated for non-empty boards

@@ -324,13 +324,14 @@ extractInlinedWords entry wordLength =
   in takeWhile (not . null) $ map (maybe [] id . extractWord) [i * wordLength | i <- [0 .. maxWords - 1]]
 
 -- | Extract uninlined words from entry
+-- Note: word_start is a BYTE offset into word_letters, not a word index
 extractUninlinedWords :: WMPEntry -> WMPForLength -> Int -> [[MachineLetter]]
 extractUninlinedWords entry wfl wordLength =
-  let start = fromIntegral $ wmpEntryWordStart entry
+  let start = fromIntegral $ wmpEntryWordStart entry  -- byte offset
       numWords = fromIntegral $ wmpEntryNumWords entry
       letters = wflWordLetters wfl
       extractWord idx =
-        let offset = (start + idx) * wordLength
+        let offset = start + idx * wordLength  -- start is already byte offset
         in [ MachineLetter (BS.index letters (offset + i))
            | i <- [0 .. wordLength - 1] ]
   in [ extractWord i | i <- [0 .. numWords - 1] ]

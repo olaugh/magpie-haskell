@@ -53,12 +53,12 @@ main = do
       -- Test generateBestMove (use 100 for bagCount - full bag)
       putStrLn ""
       putStrLn "Best move by score (no KLV):"
-      let bestNoKlv = generateBestMove defaultMoveGenConfig Nothing kwg ld board rack 100
+      let bestNoKlv = generateBestMove defaultMoveGenConfig Nothing Nothing kwg ld board rack 100
       putStrLn $ "  " ++ showMove ld bestNoKlv ++ " score=" ++ show (moveScore bestNoKlv)
 
       putStrLn ""
       putStrLn "Best move by equity (with KLV):"
-      let bestWithKlv = generateBestMove defaultMoveGenConfig (Just klv) kwg ld board rack 100
+      let bestWithKlv = generateBestMove defaultMoveGenConfig (Just klv) Nothing kwg ld board rack 100
       putStrLn $ "  " ++ showMove ld bestWithKlv ++ " score=" ++ show (moveScore bestWithKlv) ++
                  " equity=" ++ show (moveEquity bestWithKlv)
   where

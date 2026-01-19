@@ -16,23 +16,25 @@ module Magpie.MoveGen
 
 import Magpie.Types
 import Magpie.KWG
-import Magpie.KLV (KLV, klvGetLeaveValueFromTiles)
+import Magpie.KLV (KLV, klvGetLeaveValue, klvGetLeaveValueFromTiles)
 import Magpie.Board
 import Magpie.LetterDistribution
 import Magpie.Shadow (generateAnchors, Anchor(..), ShadowConfig(..), defaultShadowConfig)
 import Magpie.WMP (WMP)
 import Magpie.WMPMoveGen
+import Magpie.BitRack (BitRack, emptyBitRack, bitRackAddLetter)
 
 import Data.Word (Word8, Word32, Word64)
 import Data.Int (Int32)
 import Data.Bits (testBit, setBit, (.&.))
+-- import Debug.Trace (trace, traceM)  -- Uncomment for debugging
 import Data.List (sortBy)
 import Data.Ord (comparing, Down(..))
 import qualified Data.Vector.Unboxed as VU
 import qualified Data.Vector.Unboxed.Mutable as MVU
 import qualified Data.IntMap.Strict as IM
 import Control.Monad.ST (ST, runST)
-import Control.Monad (when)
+import Control.Monad (when, forM_)
 import Data.STRef (STRef, newSTRef, readSTRef, writeSTRef)
 
 -- | Configuration for move generation
@@ -151,14 +153,24 @@ generateBestMove cfg mKlv mWmp kwg ld board rack bagCount =
       -- Initialize WMP move gen for shadow pruning
       -- Compute nonplaythrough existence once at the beginning
       wmgBase = wmpMoveGenInit mWmp rack
-      wmg = if wmpMoveGenIsActive wmgBase
+      wmgWithExistence = if wmpMoveGenIsActive wmgBase
             then wmpMoveGenCheckNonplaythroughExistence False (const (Equity 0)) $
                  wmpMoveGenResetPlaythrough wmgBase
             else wmgBase
+      -- Compute best leave values if KLV is available
+      wmg = case mKlv of
+              Just klv -> wmpMoveGenComputeBestLeavesWithKLV (klvGetLeaveValue klv) rack wmgWithExistence
+              Nothing  -> wmgWithExistence
 
       -- Generate shadow anchors (sorted by highest possible equity descending)
       -- WMP is used for word existence checking in shadow pruning
-      shadowCfg = defaultShadowConfig { shadowBingoBonus = mgcBingoBonus cfg }
+      -- Multi-anchor mode is only used for empty boards (first move) where WMP move gen is used
+      -- For mid-game, single-anchor mode with GADDAG is more efficient
+      boardIsEmpty = getTilesPlayed board == 0
+      shadowCfg = defaultShadowConfig { shadowBingoBonus = mgcBingoBonus cfg
+                                      , shadowBagCount = bagCount
+                                      , shadowMultiAnchor = boardIsEmpty && wmpMoveGenIsActive wmg
+                                      }
       anchors = generateAnchors shadowCfg kwg ld board rack wmg
 
       -- Process anchors in order, stopping when we can't beat the best
@@ -207,7 +219,6 @@ generateBestMove cfg mKlv mWmp kwg ld board rack bagCount =
 
       -- Check if a nonplaythrough word of given length exists (using WMP if available)
       -- This is only valid for empty boards where all moves are nonplaythrough
-      boardIsEmpty = getTilesPlayed board == 0
       wordLengthExists :: Int -> Bool
       wordLengthExists len =
         if wmpMoveGenIsActive wmg && boardIsEmpty
@@ -252,12 +263,21 @@ generateBestMove cfg mKlv mWmp kwg ld board rack bagCount =
                   maxWordLen = rackSize'
                   anyWordExists = any wordLengthExists [minWordLen..maxWordLen]
 
-              -- Skip this anchor if WMP says no nonplaythrough words exist (empty board only)
+              -- Choose between WMP-based generation and GADDAG-based generation
+              -- WMP move generation is only used for empty board (first move)
+              -- For mid-game, GADDAG handles playthrough moves correctly
               when anyWordExists $
-                recursiveGenBestSTDir cfg mKlv rack maxLeaveValue kwg ld boardForDir rackM rackCrossSet
-                                      dir genRow genAncCol genLastAncCol
-                                      (gaddagRoot kwg) genAncCol genAncCol genAncCol
-                                      initialUniquePlay 0 1 0 0 distSize strip bestRef
+                if boardIsEmpty && anchorTilesToPlay anchor > 0 && wmpMoveGenIsActive wmg && anchorPlaythroughBlocks anchor == 0
+                then
+                  -- WMP-based generation for nonplaythrough (empty board only)
+                  wordmapGenST cfg mKlv wmg rack maxLeaveValue ld boardForDir
+                               dir genRow anchor bestRef
+                else
+                  -- GADDAG-based generation for mid-game or non-WMP
+                  recursiveGenBestSTDir cfg mKlv rack maxLeaveValue kwg ld boardForDir rackM rackCrossSet
+                                        dir genRow genAncCol genLastAncCol
+                                        (gaddagRoot kwg) genAncCol genAncCol genAncCol
+                                        initialUniquePlay 0 1 0 0 distSize strip bestRef
 
               loop rest
 
@@ -969,4 +989,159 @@ recursiveGenBestSTDir cfg mKlv origRack maxLeaveVal kwg ld board rackM rackCross
             recGen nodeIdx (currentCol + 1) leftstrip newRightstrip
                    newUniquePlay newMainScore newWordMult newCrossScore tilesPlayed
 
+-- ============================================================================
+-- WMP-based move generation (replaces GADDAG for WMP anchors)
+-- ============================================================================
+
+-- | WMP-based move generation for a single anchor (nonplaythrough only)
+-- Uses WMP word lookup instead of GADDAG traversal
+-- For now, only handles nonplaythrough (empty board) case
+wordmapGenST :: MoveGenConfig -> Maybe KLV -> WMPMoveGen -> Rack -> Int32 -> LetterDistribution -> Board
+             -> Direction -> Int -> Anchor -> BestMoveRef s -> ST s ()
+wordmapGenST cfg mKlv wmg origRack _maxLeaveVal ld board dir genRow anchor bestRef = do
+  let tilesToPlay = anchorTilesToPlay anchor
+      wordLength = anchorWordLength anchor
+      startCol = anchorCol anchor  -- For empty board, word starts at anchor column
+      playthroughBlocks = anchorPlaythroughBlocks anchor
+
+  -- Only handle nonplaythrough case for now
+  when (playthroughBlocks == 0) $ do
+    case wmgWMP wmg of
+      Nothing -> return ()
+      Just _wmp -> do
+        -- Initialize subracks for this anchor
+        let wmg' = wmpMoveGenPlaythroughSubracksInit tilesToPlay wordLength wmg
+            numCombinations = wmpMoveGenGetNumSubrackCombinations wmg'
+
+        -- Safety: skip if numCombinations is 0 or very large
+        when (numCombinations > 0 && numCombinations <= 128) $ do
+          -- Iterate through subrack combinations
+          forM_ [0 .. numCombinations - 1] $ \subrackIdx -> do
+            -- Get words for this subrack
+            let (_wmg'', wordList) = wmpMoveGenGetSubrackWords subrackIdx wmg'
+                leaveVal = wmpMoveGenGetLeaveValue subrackIdx wmg'
+
+            -- Check pruning early
+            (_, Equity bestEquity) <- readSTRef bestRef
+            let maxScoreForAnchor = anchorHighestPossibleScore anchor
+                maxPossibleEquity = fromIntegral maxScoreForAnchor * 1000 + fromIntegral (equityToInt32 leaveVal)
+
+            when (maxPossibleEquity > bestEquity && not (null wordList)) $ do
+              -- Iterate through words
+              forM_ wordList $ \word -> do
+                -- Check if the word is valid at this position (cross-sets)
+                let checkResult = checkPlaythroughAndCrosses ld board genRow startCol word
+                case checkResult of
+                  Nothing -> return ()  -- Invalid - skip
+                  Just playthroughMarked -> do
+                    -- Score and record the move
+                    recordWMPMove cfg mKlv origRack bestRef ld board
+                                  dir genRow startCol tilesToPlay
+                                  playthroughMarked (equityToInt32 leaveVal)
+
+-- | Build playthrough BitRack by scanning board tiles from rightmostStartCol
+buildPlaythroughBitRack :: Board -> Int -> Int -> Int -> BitRack
+buildPlaythroughBitRack board row startCol wordLength = go emptyBitRack startCol 0
+  where
+    go !br !col !count
+      | count >= wordLength = br
+      | col >= boardDim = br
+      | otherwise =
+          let letter = getLetter board row col
+          in if unML letter /= 0
+             then let unblanked = unblankLetter letter
+                  in go (bitRackAddLetter unblanked br) (col + 1) (count + 1)
+             else go br (col + 1) (count + 1)
+
+-- | Check if a WMP word is valid at a given position
+-- Returns Just playthroughMarked if valid, Nothing if invalid
+-- playthroughMarked contains the word with PLAYED_THROUGH_MARKER for board tiles
+checkPlaythroughAndCrosses :: LetterDistribution -> Board -> Int -> Int -> [MachineLetter] -> Maybe [MachineLetter]
+checkPlaythroughAndCrosses ld board row startCol word = go word startCol []
+  where
+    go [] _ acc = Just (reverse acc)
+    go (ml:rest) col acc
+      | col >= boardDim = Nothing  -- Word extends beyond board
+      | otherwise =
+          let boardLetter = getLetter board row col
+          in if unML boardLetter == 0
+             then -- Empty square: check cross-set
+               let crossSet = getCrossSet board row col
+               in if crossSet == 1 || not (testBit crossSet (fromIntegral (unML ml)))
+                  then Nothing  -- Letter not allowed by cross-set
+                  else go rest (col + 1) (ml : acc)
+             else -- Occupied square: check if board letter matches word letter
+               let unblankedBoard = unblankLetter boardLetter
+               in if unblankedBoard /= ml
+                  then Nothing  -- Mismatch
+                  else go rest (col + 1) (playedThroughML : acc)  -- Mark as played-through
+
+-- | Record a WMP move (handles blank assignment and scoring)
+recordWMPMove :: MoveGenConfig -> Maybe KLV -> Rack -> BestMoveRef s
+              -> LetterDistribution -> Board -> Direction -> Int -> Int -> Int
+              -> [MachineLetter] -> Int32 -> ST s ()
+recordWMPMove cfg _mKlv _origRack bestRef ld board dir row startCol tilesToPlay
+              playthroughMarked leaveVal = do
+  -- Score the move
+  let (mainScore, crossScore, wordMult) = scoreWMPWord ld board row startCol playthroughMarked
+      finalMainScore = mainScore * wordMult
+      bingoBonus = if tilesToPlay >= defaultRackSize then mgcBingoBonus cfg else 0
+      totalScore = finalMainScore + crossScore + bingoBonus
+
+  -- Compute equity
+  let equity = Equity (fromIntegral totalScore * 1000 + leaveVal)
+
+  -- Extract tiles played (excluding played-through markers)
+  let tilesPlayed = [ml | ml <- playthroughMarked, ml /= playedThroughML]
+
+  -- Build the move
+  let (outRow, outCol) = case dir of
+        Horizontal -> (row, startCol)
+        Vertical   -> (startCol, row)
+      move = Move
+        { moveType = TilePlacement
+        , moveRow = outRow
+        , moveCol = outCol
+        , moveDir = dir
+        , moveTiles = tilesPlayed
+        , moveTilesUsed = tilesToPlay
+        , moveScore = totalScore
+        , moveEquity = equity
+        }
+
+  -- Update best if better
+  (currentBest, _) <- readSTRef bestRef
+  when (compareMove move currentBest == GT) $
+    writeSTRef bestRef (move, equity)
+
+-- | Score a WMP word (with playthrough markers)
+scoreWMPWord :: LetterDistribution -> Board -> Int -> Int -> [MachineLetter] -> (Int, Int, Int)
+scoreWMPWord ld board row startCol playthroughMarked = go playthroughMarked startCol 0 0 1
+  where
+    go [] _ mainScore crossScore wordMult = (mainScore, crossScore, wordMult)
+    go (ml:rest) col mainScore crossScore wordMult
+      | col >= boardDim = (mainScore, crossScore, wordMult)
+      | otherwise =
+          let sq = getSquare board row col
+              bonus = sqBonus sq
+          in if ml == playedThroughML
+             then -- Playthrough tile: add to main score, no bonus
+               let boardLetter = getLetter board row col
+                   unblanked = unblankLetter boardLetter
+                   tileScore = if isBlank boardLetter then 0 else ldScore ld unblanked
+               in go rest (col + 1) (mainScore + tileScore) crossScore wordMult
+             else -- Freshly placed tile: apply bonuses
+               let letterMult = letterMultiplier bonus
+                   thisWordMult = wordMultiplier bonus
+                   tileScore = if isBlank ml then 0 else ldScore ld (unblankLetter ml)
+                   scoredLetter = tileScore * letterMult
+                   crossWordBase = getCrossScore board row col
+                   newCrossScore = if crossWordBase > 0
+                                   then crossScore + (crossWordBase + scoredLetter) * thisWordMult
+                                   else crossScore
+               in go rest (col + 1) (mainScore + scoredLetter) newCrossScore (wordMult * thisWordMult)
+
+-- | Helper to convert Equity to Int32
+equityToInt32 :: Equity -> Int32
+equityToInt32 (Equity e) = e
 

@@ -9,6 +9,7 @@ module Magpie.BitRack
   , bitRackAddLetter
   , bitRackRemoveLetter
   , bitRackGetLetterCount
+  , bitRackSetLetterCount
   , bitRackGetBucketIndex
   , bitRackFromTiles
   , bitRackFromString
@@ -86,6 +87,23 @@ bitRackGetLetterCount (MachineLetter ml) (BitRack lo hi)
   | otherwise =
       let shift = (fromIntegral ml - 16) * bitRackBitsPerLetter
       in fromIntegral ((hi `shiftR` shift) .&. bitRackMaxCountPerLetter)
+
+-- | Set the count of a specific letter (matching C bit_rack_set_letter_count)
+{-# INLINE bitRackSetLetterCount #-}
+bitRackSetLetterCount :: MachineLetter -> Int -> BitRack -> BitRack
+bitRackSetLetterCount (MachineLetter ml) count (BitRack lo hi)
+  | ml < 16 =
+      let shift = fromIntegral ml * bitRackBitsPerLetter
+          mask = bitRackMaxCountPerLetter `shiftL` shift
+          newVal = fromIntegral count `shiftL` shift
+      in BitRack ((lo .&. complement mask) .|. newVal) hi
+  | otherwise =
+      let shift = (fromIntegral ml - 16) * bitRackBitsPerLetter
+          mask = bitRackMaxCountPerLetter `shiftL` shift
+          newVal = fromIntegral count `shiftL` shift
+      in BitRack lo ((hi .&. complement mask) .|. newVal)
+  where
+    complement x = xor x maxBound
 
 -- | Get the number of blanks in the BitRack (letter 0)
 {-# INLINE bitRackNumBlanks #-}

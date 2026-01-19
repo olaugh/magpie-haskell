@@ -53,9 +53,9 @@ runTestCase kwg ld (cgp, rackStr) = do
                    (m:_) -> m
                    [] -> Move Pass 0 0 Horizontal [] 0 0 (Equity 0)
 
-      -- Generate best move with shadow pruning (no KLV, so compare by score)
+      -- Generate best move with shadow pruning (no KLV/WMP, so compare by score)
       -- Use 100 for bagCount (full bag, exchanges allowed)
-      shadowBest = generateBestMove defaultMoveGenConfig Nothing kwg ld board rack 100
+      shadowBest = generateBestMove defaultMoveGenConfig Nothing Nothing kwg ld board rack 100
 
       -- Compare scores
       fullScore = moveScore fullBest

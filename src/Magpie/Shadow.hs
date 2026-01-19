@@ -1,5 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE RankNTypes #-}
 
 -- | Shadow algorithm for computing upper bounds on move scores
 -- Ported from MAGPIE (domino14/magpie) - originally developed in wolges
@@ -28,14 +29,38 @@ import Magpie.Board (Board, computeAnchors, computeCrossSets, getCrossSet, getCr
                      trivialCrossSet, getLeftExtensionSet, getRightExtensionSet)
 import Magpie.LetterDistribution
 import Magpie.WMPMoveGen
+import Magpie.Equity (Equity(..), equityToInt)
 
 import Data.Word (Word64)
 import Data.Bits ((.&.), (.|.), complement, popCount, countTrailingZeros)
 import Data.List (sortBy)
 import Data.Ord (comparing, Down(..))
 import qualified Data.Vector.Unboxed as VU
-import Control.Monad.ST (runST)
+import Control.Monad.ST (ST, runST)
 import qualified Data.Vector.Unboxed.Mutable as MVU
+import Control.Monad (when)
+
+-- | Mutable per-tiles state for tracking best scores by word length
+-- Used only when WMP is active for O(1) updates instead of O(n) vector copies
+data MPerTilesState s = MPerTilesState
+  { mptsScores   :: !(MVU.MVector s Int)  -- Best score for each tiles_played (0-7)
+  , mptsEquities :: !(MVU.MVector s Int)  -- Best equity for each tiles_played (0-7)
+  }
+
+-- | Create new mutable per-tiles state initialized to minBound
+newMPerTilesState :: ST s (MPerTilesState s)
+newMPerTilesState = do
+  scores <- MVU.replicate 8 minBound
+  equities <- MVU.replicate 8 minBound
+  return $ MPerTilesState scores equities
+
+-- | Update per-tiles state with a new score/equity for given tiles_played
+updatePerTilesState :: MPerTilesState s -> Int -> Int -> Int -> ST s ()
+updatePerTilesState mpts tilesPlayed score equity = do
+  currentScore <- MVU.read (mptsScores mpts) tilesPlayed
+  when (score > currentScore) $ do
+    MVU.write (mptsScores mpts) tilesPlayed score
+    MVU.write (mptsEquities mpts) tilesPlayed equity
 
 -- | An anchor represents a position where moves can start, with upper bound info
 data Anchor = Anchor
@@ -59,6 +84,9 @@ type AnchorHeap = [Anchor]
 data ShadowConfig = ShadowConfig
   { shadowBingoBonus :: !Int
   , shadowSortByScore :: !Bool  -- If True, sort by score; if False, by equity
+  , shadowBagCount :: !Int      -- Number of tiles in bag (for WMP leave values)
+  , shadowMultiAnchor :: !Bool  -- If True, generate one anchor per word length (for WMP move gen)
+                                -- If False, generate single anchor per position (for GADDAG move gen)
   } deriving (Show)
 
 -- | Default shadow config
@@ -66,6 +94,8 @@ defaultShadowConfig :: ShadowConfig
 defaultShadowConfig = ShadowConfig
   { shadowBingoBonus = 50
   , shadowSortByScore = True
+  , shadowBagCount = 100  -- Default to non-empty bag (enables leave values)
+  , shadowMultiAnchor = True  -- Multi-anchor mode for WMP move generation
   }
 
 -- | Unrestricted multiplier with column information
@@ -112,7 +142,7 @@ data MoveGen = MoveGen
   , mgShadowMainwordRestrictedScore :: !Int  -- Playthrough + restricted tiles * letter_mult
   , mgShadowWordMultiplier         :: !Int  -- Product of word multipliers
 
-    -- Best scores found
+    -- Best scores found (overall max)
   , mgHighestShadowEquity    :: !Int
   , mgHighestShadowScore     :: !Int
 
@@ -127,8 +157,8 @@ data MoveGen = MoveGen
     -- Letter distribution reference
   , mgLdSize                 :: !Int
 
-    -- WMP move generation state
-  , mgWMPMoveGen             :: !WMPMoveGen
+    -- WMP static state (immutable; playthrough state is handled via ST monad)
+  , mgWMPStatic              :: !(Maybe WMPStatic)
   } deriving (Show)
 
 -- | Initialize MoveGen for shadow scoring
@@ -137,6 +167,10 @@ initMoveGen ld rack bingoBonus anchorCol wmg =
   let rackCS = computeRackCrossSet rack (ldSize ld)
       numLetters = rackTotal rack
       descScores = sortTileScoresDescending ld rack
+      -- Extract static WMP state (if WMP is active)
+      mWmpStatic = if wmpMoveGenIsActive wmg
+                   then Just (wmpStaticFromMoveGen wmg)
+                   else Nothing
   in MoveGen
      { mgCurrentRowIndex = 0
      , mgCurrentAnchorCol = anchorCol
@@ -165,7 +199,7 @@ initMoveGen ld rack bingoBonus anchorCol wmg =
      , mgDescTileScores = descScores
      , mgRowCache = []
      , mgLdSize = ldSize ld
-     , mgWMPMoveGen = wmg
+     , mgWMPStatic = mWmpStatic
      }
 
 -- | Compute rack cross set (bitmask of available letters)
@@ -221,7 +255,10 @@ generateAnchors cfg kwg ld board rack wmg =
                  else concatMap (shadowRow cfg ld boardV rack Vertical wmg) [0..boardDim-1]
 
       allAnchors = hAnchors ++ vAnchors
-  in sortBy (comparing (Down . anchorHighestPossibleEquity)) allAnchors
+      -- Sort by score bound (not equity bound) for consistent pruning
+      -- The pruning in MoveGen uses score * 1000 + maxLeaveValue, so sorting
+      -- by score maintains consistent anchor ordering regardless of leave values
+  in sortBy (comparing (Down . anchorHighestPossibleScore)) allAnchors
 
 -- | Generate anchors for a single row (direction-agnostic)
 -- For horizontal plays, this processes a row (row index, iterating over columns)
@@ -274,22 +311,20 @@ processAnchors :: ShadowConfig -> LetterDistribution -> Board -> Rack -> Directi
                -> WMPMoveGen -> Int -> Int -> [Int] -> AnchorHeap
 processAnchors _ _ _ _ _ _ _ _ [] = []
 processAnchors cfg ld board rack dir wmg rowOrCol lastAnchorCol (col:rest) =
-  let -- Reset WMP playthrough state for each anchor
-      wmg' = wmpMoveGenResetPlaythrough wmg
-      mAnchor = shadowPlayForAnchor cfg ld board rack dir wmg' rowOrCol col lastAnchorCol
+  let -- WMP playthrough state is now reset inside shadowPlayForAnchor (via ST monad)
+      anchors = shadowPlayForAnchor cfg ld board rack dir wmg rowOrCol col lastAnchorCol
       -- Update lastAnchorCol
       newLastAnchorCol = if not (isEmptyForDir board rowOrCol col dir)
                          then col + 1  -- Skip one after occupied
                          else col
       restAnchors = processAnchors cfg ld board rack dir wmg rowOrCol newLastAnchorCol rest
-  in case mAnchor of
-       Nothing -> restAnchors
-       Just anchor -> anchor : restAnchors
+  in anchors ++ restAnchors
 
--- | Compute shadow score for a single anchor
--- Returns Nothing if no valid plays exist from this anchor
+-- | Compute shadow scores for a single anchor position
+-- Returns multiple anchors (one per valid word length) when WMP is active
+-- The shadow computation runs inside an ST block with mutable WMP playthrough state.
 shadowPlayForAnchor :: ShadowConfig -> LetterDistribution -> Board -> Rack -> Direction
-                    -> WMPMoveGen -> Int -> Int -> Int -> Maybe Anchor
+                    -> WMPMoveGen -> Int -> Int -> Int -> [Anchor]
 shadowPlayForAnchor cfg ld board rack dir wmg rowOrCol col lastAnchorCol =
   let gen0 = initMoveGen ld rack (shadowBingoBonus cfg) col wmg
       gen1 = gen0 { mgLastAnchorCol = lastAnchorCol
@@ -307,463 +342,78 @@ shadowPlayForAnchor cfg ld board rack dir wmg rowOrCol col lastAnchorCol =
       anyExtension = mgAnchorLeftExtensionSet gen2 /= 0 || mgAnchorRightExtensionSet gen2 /= 0
 
   in if not anyExtension
-     then Nothing
+     then []
      else
        let currentLetter = getLetterForDir board rowOrCol col dir
-           gen3 = if unML currentLetter == 0
-                  then shadowStartNonplaythrough cfg ld board gen2
-                  else shadowStartPlaythrough cfg ld board currentLetter gen2
+           wmpActive = case mgWMPStatic gen2 of { Just _ -> True; Nothing -> False }
 
-           maxTiles = mgMaxTilesToPlay gen3
            (actualRow, actualCol) = case dir of
                                       Horizontal -> (rowOrCol, col)
                                       Vertical   -> (col, rowOrCol)
-       in if maxTiles == 0
-          then Nothing
-          else Just Anchor
+
+           makeAnchor tilesPlayed score equity = Anchor
                { anchorRow = actualRow
                , anchorCol = actualCol
                , anchorLastAnchorCol = lastAnchorCol
                , anchorDir = dir
-               , anchorHighestPossibleScore = mgHighestShadowScore gen3
-               , anchorHighestPossibleEquity = mgHighestShadowEquity gen3
-               , anchorTilesToPlay = maxTiles
+               , anchorHighestPossibleScore = score
+               , anchorHighestPossibleEquity = equity
+               , anchorTilesToPlay = tilesPlayed
                , anchorPlaythroughBlocks = 0
-               , anchorWordLength = 0
+               , anchorWordLength = tilesPlayed
                , anchorLeftmostStartCol = col
                , anchorRightmostStartCol = col
                }
 
--- | Start shadow from empty anchor square (non-playthrough)
-shadowStartNonplaythrough :: ShadowConfig -> LetterDistribution -> Board -> MoveGen -> MoveGen
-shadowStartNonplaythrough cfg ld board gen =
-  let col = mgCurrentLeftCol gen
-      rowOrCol = mgCurrentRowIndex gen
-      dir = mgDir gen
-      (_, crossSet, crossScore, bonus, _, _) = getBoardData board rowOrCol col dir
-      rackCS = mgRackCrossSet gen
-      possibleLetters = crossSet .&. rackCS
-
-  in if possibleLetters == 0
-     then gen
-     else
-       let letterMult = letterMultiplier bonus
-           thisWordMult = wordMultiplier bonus
-
-           -- Set word multiplier to 0 temporarily (like C code)
-           gen0 = gen { mgShadowWordMultiplier = 0 }
-
-           -- Try to restrict tile if only one letter possible
-           (restricted, restrictedTileScore, gen1) = tryRestrictTile ld possibleLetters letterMult gen0
-
-           -- Insert unrestricted multiplier BEFORE recording
-           crossWordMult = if crossScore > 0 then letterMult * thisWordMult else 0
-           gen2 = if not restricted
-                  then insertUnrestrictedMultipliers ld letterMult thisWordMult crossWordMult col gen1
-                  else gen1
-
-           -- Compute perpendicular score contribution
-           -- For restricted tiles with cross-words, include the tile's contribution
-           perpScore = crossScore * thisWordMult +
-                       (if restricted && crossScore > 0
-                        then restrictedTileScore * letterMult * thisWordMult
-                        else 0)
-
-           -- Update tiles played and perp score
-           gen3 = gen2
-             { mgTilesPlayed = mgTilesPlayed gen2 + 1
-             , mgShadowPerpAdditionalScore = perpScore
-             }
-
-           -- Record single tile play (for both directions)
-           gen4 = shadowRecord cfg gen3
-
-           -- Set word multiplier to actual value
-           gen5 = gen4 { mgShadowWordMultiplier = thisWordMult }
-
-           -- Recalculate effective multipliers with correct word_mult
-           gen6 = maybeRecalculateEffectiveMultipliers ld gen5
-
-           -- Continue left
-           isUnique = dir == Horizontal
-           gen7 = nonplaythroughShadowPlayLeft cfg ld board isUnique gen6
-
-       in gen7
-
--- | Start shadow from occupied anchor square (playthrough)
-shadowStartPlaythrough :: ShadowConfig -> LetterDistribution -> Board -> MachineLetter -> MoveGen -> MoveGen
-shadowStartPlaythrough cfg ld board currentLetter gen =
-  let -- Traverse through all placed tiles
-      gen1 = traversePlaythrough ld board currentLetter gen
-      -- Increment playthrough blocks in WMP state
-      wmg2 = if wmpMoveGenIsActive (mgWMPMoveGen gen1)
-             then wmpMoveGenIncrementPlaythroughBlocks (mgWMPMoveGen gen1)
-             else mgWMPMoveGen gen1
-      gen2 = gen1 { mgWMPMoveGen = wmg2 }
-      -- Continue with playthrough shadow
-      isUnique = mgDir gen == Horizontal
-      gen3 = playthroughShadowPlayLeft cfg ld board isUnique gen2
-  in gen3
-
--- | Traverse through placed tiles going left, accumulating score
--- Also tracks playthrough letters in WMP state
-traversePlaythrough :: LetterDistribution -> Board -> MachineLetter -> MoveGen -> MoveGen
-traversePlaythrough ld board ml gen =
-  let unblanked = unblankLetter ml
-      tileScore = ldScore ld unblanked
-      col = mgCurrentLeftCol gen
-      rowOrCol = mgCurrentRowIndex gen
-      dir = mgDir gen
-      lastAnchorCol = mgLastAnchorCol gen
-      -- Add playthrough letter to WMP state
-      wmg1 = if wmpMoveGenIsActive (mgWMPMoveGen gen)
-             then wmpMoveGenAddPlaythroughLetter unblanked (mgWMPMoveGen gen)
-             else mgWMPMoveGen gen
-      gen1 = gen { mgShadowMainwordRestrictedScore = mgShadowMainwordRestrictedScore gen + tileScore
-                 , mgWMPMoveGen = wmg1
-                 }
-  in if col == 0 || col == lastAnchorCol + 1
-     then gen1
-     else
-       let newCol = col - 1
-           nextLetter = getLetterForDir board rowOrCol newCol dir
-       in if unML nextLetter == 0
-          then gen1 { mgCurrentLeftCol = col }  -- Hit empty, stay at current
-          else traversePlaythrough ld board nextLetter
-                                   (gen1 { mgCurrentLeftCol = newCol })
-
--- | Shadow play left from non-playthrough start
-nonplaythroughShadowPlayLeft :: ShadowConfig -> LetterDistribution -> Board -> Bool -> MoveGen -> MoveGen
-nonplaythroughShadowPlayLeft cfg ld board isUnique gen =
-  -- First try extending right
-  let possibleRight = mgAnchorRightExtensionSet gen .&. mgRackCrossSet gen
-      gen1 = if possibleRight /= 0
-             then shadowPlayRight cfg ld board isUnique gen
-             else gen
-      gen2 = gen1 { mgAnchorRightExtensionSet = trivialCrossSet (mgLdSize gen) }
-
-      col = mgCurrentLeftCol gen2
-      rowOrCol = mgCurrentRowIndex gen2
-      dir = mgDir gen2
-      lastAnchorCol = mgLastAnchorCol gen2
-  in if col == 0 || col == lastAnchorCol + 1 ||
-        mgTilesPlayed gen2 >= mgNumberOfLettersOnRack gen2
-     then gen2
-     else
-       -- Check if left square is occupied (playthrough)
-       let leftLetter = if col > 0 then getLetterForDir board rowOrCol (col - 1) dir else MachineLetter 0
-       in if unML leftLetter /= 0
-          then -- Found playthrough tile, traverse through it
-            -- After traversing playthrough, allow any extension (reset extension set)
-            let gen3 = traverseLeftPlaythrough ld board gen2
-                -- Increment playthrough blocks in WMP state
-                wmg4 = if wmpMoveGenIsActive (mgWMPMoveGen gen3)
-                       then wmpMoveGenIncrementPlaythroughBlocks (mgWMPMoveGen gen3)
-                       else mgWMPMoveGen gen3
-                gen4 = gen3 { mgAnchorLeftExtensionSet = trivialCrossSet (mgLdSize gen)
-                            , mgWMPMoveGen = wmg4
-                            }
-            in nonplaythroughShadowPlayLeft cfg ld board isUnique gen4
+       in if wmpActive
+          then
+            -- WMP mode: create per-tiles mutable state, freeze at end
+            let (gen3, scoreVec, equityVec) = runST $ do
+                  mwp <- newMWMPPlaythrough
+                  mpts <- newMPerTilesState
+                  gen <- if unML currentLetter == 0
+                         then shadowStartNonplaythroughST cfg ld board mwp mpts gen2
+                         else shadowStartPlaythroughST cfg ld board currentLetter mwp mpts gen2
+                  scores <- VU.freeze (mptsScores mpts)
+                  equities <- VU.freeze (mptsEquities mpts)
+                  return (gen, scores, equities)
+            in case mgWMPStatic gen3 of
+                 Just ws
+                   | shadowMultiAnchor cfg ->
+                     -- Multi-anchor mode: one anchor per word length (for WMP move generation)
+                     [ makeAnchor n score equity
+                     | n <- [minimumWordLength .. rackTotal rack]
+                     , let score = scoreVec VU.! n
+                     , score > minBound
+                     , wmpStaticWordOfLengthExists n ws || n == rackTotal rack
+                     , let equity = equityVec VU.! n
+                     ]
+                   | otherwise ->
+                     -- Single-anchor mode: use max score from any word length (for GADDAG move generation)
+                     -- Still use WMP for existence checking
+                     let validLengths = [n | n <- [minimumWordLength .. rackTotal rack]
+                                          , wmpStaticWordOfLengthExists n ws || n == rackTotal rack
+                                          , scoreVec VU.! n > minBound]
+                     in case validLengths of
+                          [] -> []
+                          _  -> let maxTiles = maximum validLengths
+                                    maxScore = maximum [scoreVec VU.! n | n <- validLengths]
+                                    maxEquity = maximum [equityVec VU.! n | n <- validLengths]
+                                in [makeAnchor maxTiles maxScore maxEquity]
+                 Nothing -> []
           else
-            -- Empty square, check if we can extend
-            let possibleLeft = mgAnchorLeftExtensionSet gen2 .&. mgRackCrossSet gen2
-            in if possibleLeft == 0
-               then gen2
-               else
-                 let (_, crossSet, crossScore, bonus, _, _) = getBoardData board rowOrCol (col - 1) dir
-                     possibleHere = possibleLeft .&. crossSet
-                 in if possibleHere == 0
-                    then gen2
-                    else
-                      let gen3 = gen2 { mgAnchorLeftExtensionSet = trivialCrossSet (mgLdSize gen2)
-                                      , mgCurrentLeftCol = col - 1
-                                      , mgTilesPlayed = mgTilesPlayed gen2 + 1
-                                      }
-                          letterMult = letterMultiplier bonus
-                          thisWordMult = wordMultiplier bonus
+            -- Non-WMP mode: no per-tiles tracking needed, just use max values
+            let gen3 = runST $ do
+                  mwp <- newMWMPPlaythrough
+                  mpts <- newMPerTilesState  -- Dummy, won't be updated
+                  if unML currentLetter == 0
+                    then shadowStartNonplaythroughST cfg ld board mwp mpts gen2
+                    else shadowStartPlaythroughST cfg ld board currentLetter mwp mpts gen2
+                maxTiles = mgMaxTilesToPlay gen3
+            in if maxTiles == 0
+               then []
+               else [makeAnchor maxTiles (mgHighestShadowScore gen3) (mgHighestShadowEquity gen3)]
 
-                          (restricted, restrictedTileScore, gen4) = tryRestrictTile ld possibleHere letterMult gen3
-
-                          -- Compute perpendicular score contribution
-                          -- For restricted tiles with cross-words, include the tile's contribution
-                          perpContrib = crossScore * thisWordMult +
-                                        (if restricted && crossScore > 0
-                                         then restrictedTileScore * letterMult * thisWordMult
-                                         else 0)
-
-                          gen5 = gen4 { mgShadowWordMultiplier = mgShadowWordMultiplier gen4 * thisWordMult
-                                      , mgShadowPerpAdditionalScore = mgShadowPerpAdditionalScore gen4 + perpContrib
-                                      }
-
-                          crossWordMult = if crossScore > 0 then letterMult * thisWordMult else 0
-                          gen6 = if not restricted
-                                 then insertUnrestrictedMultipliers ld letterMult thisWordMult crossWordMult (col - 1) gen5
-                                 else gen5
-
-                          gen7 = shadowRecord cfg gen6
-
-                      in nonplaythroughShadowPlayLeft cfg ld board isUnique gen7
-
--- | Traverse through playthrough tiles going left
--- Also tracks playthrough letters in WMP state
-traverseLeftPlaythrough :: LetterDistribution -> Board -> MoveGen -> MoveGen
-traverseLeftPlaythrough ld board gen =
-  let col = mgCurrentLeftCol gen
-      rowOrCol = mgCurrentRowIndex gen
-      dir = mgDir gen
-      lastAnchorCol = mgLastAnchorCol gen
-  in if col == 0 || col == lastAnchorCol + 1
-     then gen
-     else
-       let leftCol = col - 1
-           leftLetter = getLetterForDir board rowOrCol leftCol dir
-       in if unML leftLetter == 0
-          then gen  -- Hit empty, stay at current
-          else
-            let unblanked = unblankLetter leftLetter
-                tileScore = ldScore ld unblanked
-                -- Add playthrough letter to WMP state
-                wmg1 = if wmpMoveGenIsActive (mgWMPMoveGen gen)
-                       then wmpMoveGenAddPlaythroughLetter unblanked (mgWMPMoveGen gen)
-                       else mgWMPMoveGen gen
-                gen1 = gen { mgShadowMainwordRestrictedScore = mgShadowMainwordRestrictedScore gen + tileScore
-                           , mgCurrentLeftCol = leftCol
-                           , mgWMPMoveGen = wmg1
-                           }
-            in traverseLeftPlaythrough ld board gen1
-
--- | Shadow play left from playthrough start
-playthroughShadowPlayLeft :: ShadowConfig -> LetterDistribution -> Board -> Bool -> MoveGen -> MoveGen
-playthroughShadowPlayLeft cfg ld board isUnique gen =
-  -- First try extending right
-  let possibleRight = mgAnchorRightExtensionSet gen .&. mgRackCrossSet gen
-      gen1 = if possibleRight /= 0
-             then shadowPlayRight cfg ld board isUnique gen
-             else gen
-      gen2 = gen1 { mgAnchorRightExtensionSet = trivialCrossSet (mgLdSize gen) }
-
-      col = mgCurrentLeftCol gen2
-      rowOrCol = mgCurrentRowIndex gen2
-      dir = mgDir gen2
-      lastAnchorCol = mgLastAnchorCol gen2
-  in if col == 0 || col == lastAnchorCol + 1 ||
-        mgTilesPlayed gen2 >= mgNumberOfLettersOnRack gen2
-     then gen2
-     else
-       -- Check if left square is occupied (playthrough)
-       let leftLetter = if col > 0 then getLetterForDir board rowOrCol (col - 1) dir else MachineLetter 0
-       in if unML leftLetter /= 0
-          then -- Found playthrough tile, traverse through it
-            -- After traversing playthrough, allow any extension (reset extension set)
-            let gen3 = traverseLeftPlaythrough ld board gen2
-                -- Increment playthrough blocks in WMP state
-                wmg4 = if wmpMoveGenIsActive (mgWMPMoveGen gen3)
-                       then wmpMoveGenIncrementPlaythroughBlocks (mgWMPMoveGen gen3)
-                       else mgWMPMoveGen gen3
-                gen4 = gen3 { mgAnchorLeftExtensionSet = trivialCrossSet (mgLdSize gen)
-                            , mgWMPMoveGen = wmg4
-                            }
-            in playthroughShadowPlayLeft cfg ld board isUnique gen4
-          else
-            -- Empty square, check if we can extend
-            let possibleLeft = mgAnchorLeftExtensionSet gen2 .&. mgRackCrossSet gen2
-            in if possibleLeft == 0
-               then gen2
-               else
-                 let (_, crossSet, crossScore, bonus, _, _) = getBoardData board rowOrCol (col - 1) dir
-                     possibleHere = possibleLeft .&. crossSet
-                 in if possibleHere == 0
-                    then gen2
-                    else
-                      let gen3 = gen2 { mgAnchorLeftExtensionSet = trivialCrossSet (mgLdSize gen2)
-                                      , mgCurrentLeftCol = col - 1
-                                      , mgTilesPlayed = mgTilesPlayed gen2 + 1
-                                      }
-                          letterMult = letterMultiplier bonus
-                          thisWordMult = wordMultiplier bonus
-
-                          (restricted, restrictedTileScore, gen4) = tryRestrictTile ld possibleHere letterMult gen3
-
-                          -- Compute perpendicular score contribution
-                          -- For restricted tiles with cross-words, include the tile's contribution
-                          perpContrib = crossScore * thisWordMult +
-                                        (if restricted && crossScore > 0
-                                         then restrictedTileScore * letterMult * thisWordMult
-                                         else 0)
-
-                          gen5 = gen4
-                            { mgShadowPerpAdditionalScore = mgShadowPerpAdditionalScore gen4 + perpContrib
-                            , mgShadowWordMultiplier = mgShadowWordMultiplier gen4 * thisWordMult
-                            }
-
-                          crossWordMult = if crossScore > 0 then letterMult * thisWordMult else 0
-                          gen6 = if not restricted
-                                 then insertUnrestrictedMultipliers ld letterMult thisWordMult crossWordMult (col - 1) gen5
-                                 else gen5
-
-                          newUnique = if crossSet == trivialCrossSet (mgLdSize gen) then True else isUnique
-
-                          gen7 = if playIsNonemptyAndNonduplicate (mgTilesPlayed gen6) newUnique
-                                 then shadowRecord cfg gen6
-                                 else gen6
-
-                      in playthroughShadowPlayLeft cfg ld board newUnique gen7
-
--- | Shadow play to the right
-shadowPlayRight :: ShadowConfig -> LetterDistribution -> Board -> Bool -> MoveGen -> MoveGen
-shadowPlayRight cfg ld board isUnique gen0 =
-  -- Save original state for restoration
-  let origMainScore = mgShadowMainwordRestrictedScore gen0
-      origPerpScore = mgShadowPerpAdditionalScore gen0
-      origWordMult = mgShadowWordMultiplier gen0
-      origRightCol = mgCurrentRightCol gen0
-      origTilesPlayed = mgTilesPlayed gen0
-      origDescScores = mgDescTileScores gen0
-      origRack = mgPlayerRack gen0
-      origRackCS = mgRackCrossSet gen0
-      origDescXWMuls = mgDescCrossWordMuls gen0
-      origDescEffMuls = mgDescEffLetterMuls gen0
-      origNumUnrestrMuls = mgNumUnrestrictedMuls gen0
-
-      -- Save WMP playthrough state before extending right
-      wmgSaved = wmpMoveGenSavePlaythroughState (mgWMPMoveGen gen0)
-      gen0' = gen0 { mgWMPMoveGen = wmgSaved }
-
-      -- Extend right
-      (finalGen, _) = extendRight cfg ld board isUnique gen0'
-
-      -- Restore WMP playthrough state
-      wmgRestored = wmpMoveGenRestorePlaythroughState (mgWMPMoveGen finalGen)
-
-      -- Restore original state but keep highest scores
-      restoredGen = finalGen
-        { mgShadowMainwordRestrictedScore = origMainScore
-        , mgShadowPerpAdditionalScore = origPerpScore
-        , mgShadowWordMultiplier = origWordMult
-        , mgCurrentRightCol = origRightCol
-        , mgTilesPlayed = origTilesPlayed
-        , mgDescTileScores = origDescScores
-        , mgPlayerRack = origRack
-        , mgRackCrossSet = origRackCS
-        , mgDescCrossWordMuls = origDescXWMuls
-        , mgDescEffLetterMuls = origDescEffMuls
-        , mgNumUnrestrictedMuls = origNumUnrestrMuls
-        , mgWMPMoveGen = wmgRestored
-        }
-  in restoredGen
-
--- | Extend shadow to the right
-extendRight :: ShadowConfig -> LetterDistribution -> Board -> Bool -> MoveGen -> (MoveGen, Bool)
-extendRight cfg ld board isUnique gen =
-  let col = mgCurrentRightCol gen
-      rowOrCol = mgCurrentRowIndex gen
-      dir = mgDir gen
-  in if col >= boardDim - 1 || mgTilesPlayed gen >= mgNumberOfLettersOnRack gen
-     then (gen, isUnique)
-     else
-       let newCol = col + 1
-           -- Check if next position is occupied (playthrough)
-           nextLetter = getLetterForDir board rowOrCol newCol dir
-       in if unML nextLetter /= 0
-          then -- Occupied, traverse through playthrough tiles
-            let (gen1, foundPlaythrough) = traverseRightPlaythrough ld board
-                                             (gen { mgCurrentRightCol = col })  -- Start from current col
-                -- Increment playthrough blocks in WMP state if we found any
-                wmg2 = if foundPlaythrough && wmpMoveGenIsActive (mgWMPMoveGen gen1)
-                       then wmpMoveGenIncrementPlaythroughBlocks (mgWMPMoveGen gen1)
-                       else mgWMPMoveGen gen1
-                gen2 = gen1 { mgAnchorRightExtensionSet = trivialCrossSet (mgLdSize gen)
-                            , mgWMPMoveGen = wmg2
-                            }
-            in extendRight cfg ld board isUnique gen2
-          else
-            -- Empty square, try to place a tile
-            let (_, crossSet, crossScore, bonus, leftExt, _) = getBoardData board rowOrCol newCol dir
-                rackCS = mgRackCrossSet gen
-                rightExt = mgAnchorRightExtensionSet gen
-
-                -- Non-blank cross set and left extension
-                nonblankCS = crossSet .&. complement 1
-                nonblankLeftExt = leftExt .&. complement 1
-
-            in if (nonblankCS .&. nonblankLeftExt) == 0
-               then (gen, isUnique)
-               else
-                 let possibleHere = crossSet .&. rackCS .&. rightExt .&. leftExt
-                 in if possibleHere == 0
-                    then (gen, isUnique)
-                    else
-                 let gen1 = gen
-                       { mgCurrentRightCol = newCol
-                       , mgTilesPlayed = mgTilesPlayed gen + 1
-                       , mgAnchorRightExtensionSet = trivialCrossSet (mgLdSize gen)
-                       }
-
-                     letterMult = letterMultiplier bonus
-                     thisWordMult = wordMultiplier bonus
-
-                     (restricted, restrictedTileScore, gen2) = tryRestrictTile ld possibleHere letterMult gen1
-
-                     -- Compute perpendicular score contribution
-                     -- For restricted tiles with cross-words, include the tile's contribution
-                     perpContrib = crossScore * thisWordMult +
-                                   (if restricted && crossScore > 0
-                                    then restrictedTileScore * letterMult * thisWordMult
-                                    else 0)
-
-                     gen3 = gen2
-                       { mgShadowPerpAdditionalScore = mgShadowPerpAdditionalScore gen2 + perpContrib
-                       , mgShadowWordMultiplier = mgShadowWordMultiplier gen2 * thisWordMult
-                       }
-
-                     crossWordMult = if crossScore > 0 then letterMult * thisWordMult else 0
-                     gen4 = if not restricted
-                            then insertUnrestrictedMultipliers ld letterMult thisWordMult crossWordMult newCol gen3
-                            else gen3
-
-                     newUnique = if crossSet == trivialCrossSet (mgLdSize gen) then True else isUnique
-
-                     -- Traverse through any playthrough tiles
-                     (gen5, foundPlaythrough2) = traverseRightPlaythrough ld board gen4
-                     -- Increment playthrough blocks in WMP state if we found any
-                     wmg5 = if foundPlaythrough2 && wmpMoveGenIsActive (mgWMPMoveGen gen5)
-                            then wmpMoveGenIncrementPlaythroughBlocks (mgWMPMoveGen gen5)
-                            else mgWMPMoveGen gen5
-                     gen5' = gen5 { mgWMPMoveGen = wmg5 }
-
-                     gen6 = if playIsNonemptyAndNonduplicate (mgTilesPlayed gen5') newUnique
-                            then shadowRecord cfg gen5'
-                            else gen5'
-
-                 in extendRight cfg ld board newUnique gen6
-
--- | Traverse through playthrough tiles to the right
--- Also tracks playthrough letters in WMP state and returns whether any were found
-traverseRightPlaythrough :: LetterDistribution -> Board -> MoveGen -> (MoveGen, Bool)
-traverseRightPlaythrough ld board gen =
-  let col = mgCurrentRightCol gen
-      rowOrCol = mgCurrentRowIndex gen
-      dir = mgDir gen
-  in if col + 1 >= boardDim
-     then (gen, False)
-     else
-       let nextLetter = getLetterForDir board rowOrCol (col + 1) dir
-       in if unML nextLetter == 0
-          then (gen, False)
-          else
-            let unblanked = unblankLetter nextLetter
-                tileScore = ldScore ld unblanked
-                -- Add playthrough letter to WMP state
-                wmg1 = if wmpMoveGenIsActive (mgWMPMoveGen gen)
-                       then wmpMoveGenAddPlaythroughLetter unblanked (mgWMPMoveGen gen)
-                       else mgWMPMoveGen gen
-                gen1 = gen
-                  { mgCurrentRightCol = col + 1
-                  , mgShadowMainwordRestrictedScore = mgShadowMainwordRestrictedScore gen + tileScore
-                  , mgWMPMoveGen = wmg1
-                  }
-                (gen2, _) = traverseRightPlaythrough ld board gen1
-            in (gen2, True)
 
 -- | Try to restrict a tile at a position (when cross-set has exactly one letter)
 -- Returns (wasRestricted, tileScore, newGen)
@@ -852,60 +502,6 @@ maybeRecalculateEffectiveMultipliers _ gen =
            , mgLastWordMultiplier = mgShadowWordMultiplier gen
            }
 
--- | Record a shadow score (compute upper bound and update if better)
--- Checks WMP word existence if active to prune shadow plays that can't form valid words.
--- - For bingo with playthrough: check if bingo exists with rack + playthrough tiles
--- - For nonplaythrough: check if any word of that length exists from rack
-shadowRecord :: ShadowConfig -> MoveGen -> MoveGen
-shadowRecord _cfg gen =
-  let wmg = mgWMPMoveGen gen
-      tilesPlayed = mgTilesPlayed gen
-      numLettersOnRack = mgNumberOfLettersOnRack gen
-
-      -- Check WMP existence if active
-      skipDueToWMP = if wmpMoveGenIsActive wmg
-                     then
-                       -- If playthrough and full rack (bingo): check playthrough existence
-                       if wmpMoveGenHasPlaythrough wmg && tilesPlayed == numLettersOnRack
-                       then not (wmpMoveGenCheckPlaythroughFullRackExistence wmg)
-                       -- If no playthrough and word >= 2 letters: check nonplaythrough existence
-                       else if not (wmpMoveGenHasPlaythrough wmg) && tilesPlayed >= minimumWordLength
-                       then not (wmpMoveGenNonplaythroughWordOfLengthExists tilesPlayed wmg)
-                       else False
-                     else False
-
-  in if skipDueToWMP
-     then gen  -- Skip recording, word doesn't exist
-     else let
-           -- Compute score from unrestricted tiles with best multipliers
-           tilesPlayedScore = computeUnrestrictedTilesScore gen
-
-           -- Bingo bonus
-           bingoBonus = if tilesPlayed >= defaultRackSize
-                        then mgBingoBonus gen
-                        else 0
-
-           -- Total score
-           score = tilesPlayedScore +
-                   (mgShadowMainwordRestrictedScore gen * mgShadowWordMultiplier gen) +
-                   mgShadowPerpAdditionalScore gen + bingoBonus
-
-           -- For now, equity = score (would add leave values for full implementation)
-           equity = score
-
-           -- Update max tiles played
-           newMaxTiles = max (mgMaxTilesToPlay gen) tilesPlayed
-
-           -- Update highest scores
-           newHighScore = max (mgHighestShadowScore gen) score
-           newHighEquity = max (mgHighestShadowEquity gen) equity
-
-       in gen
-          { mgHighestShadowScore = newHighScore
-          , mgHighestShadowEquity = newHighEquity
-          , mgMaxTilesToPlay = newMaxTiles
-          }
-
 -- | Compute score from unrestricted tiles with best multipliers
 -- Assigns highest-scoring tiles to highest multiplier positions
 computeUnrestrictedTilesScore :: MoveGen -> Int
@@ -924,3 +520,500 @@ playIsNonemptyAndNonduplicate tilesPlayed uniquePlay =
 -- | Extract sorted anchors (for testing)
 extractSortedAnchors :: AnchorHeap -> [Anchor]
 extractSortedAnchors = sortBy (comparing (Down . anchorHighestPossibleEquity))
+
+-- ============================================================================
+-- ST-based shadow functions (use mutable WMP playthrough state)
+-- ============================================================================
+
+-- | Start shadow from empty anchor square (non-playthrough) - ST version
+shadowStartNonplaythroughST :: ShadowConfig -> LetterDistribution -> Board
+                            -> MWMPPlaythrough s -> MPerTilesState s -> MoveGen -> ST s MoveGen
+shadowStartNonplaythroughST cfg ld board mwp mpts gen = do
+  let col = mgCurrentLeftCol gen
+      rowOrCol = mgCurrentRowIndex gen
+      dir = mgDir gen
+      (_, crossSet, crossScore, bonus, _, _) = getBoardData board rowOrCol col dir
+      rackCS = mgRackCrossSet gen
+      possibleLetters = crossSet .&. rackCS
+
+  if possibleLetters == 0
+    then return gen
+    else do
+      let letterMult = letterMultiplier bonus
+          thisWordMult = wordMultiplier bonus
+
+          -- Set word multiplier to 0 temporarily (like C code)
+          gen0 = gen { mgShadowWordMultiplier = 0 }
+
+          -- Try to restrict tile if only one letter possible
+          (restricted, restrictedTileScore, gen1) = tryRestrictTile ld possibleLetters letterMult gen0
+
+          -- Insert unrestricted multiplier BEFORE recording
+          crossWordMult = if crossScore > 0 then letterMult * thisWordMult else 0
+          gen2 = if not restricted
+                 then insertUnrestrictedMultipliers ld letterMult thisWordMult crossWordMult col gen1
+                 else gen1
+
+          -- Compute perpendicular score contribution
+          perpScore = crossScore * thisWordMult +
+                      (if restricted && crossScore > 0
+                       then restrictedTileScore * letterMult * thisWordMult
+                       else 0)
+
+          -- Update tiles played and perp score
+          gen3 = gen2
+            { mgTilesPlayed = mgTilesPlayed gen2 + 1
+            , mgShadowPerpAdditionalScore = perpScore
+            }
+
+      -- Record single tile play (for both directions)
+      gen4 <- shadowRecordST cfg mwp mpts gen3
+
+      let -- Set word multiplier to actual value
+          gen5 = gen4 { mgShadowWordMultiplier = thisWordMult }
+
+          -- Recalculate effective multipliers with correct word_mult
+          gen6 = maybeRecalculateEffectiveMultipliers ld gen5
+
+          -- Continue left
+          isUnique = dir == Horizontal
+
+      nonplaythroughShadowPlayLeftST cfg ld board isUnique mwp mpts gen6
+
+-- | Start shadow from occupied anchor square (playthrough) - ST version
+shadowStartPlaythroughST :: ShadowConfig -> LetterDistribution -> Board
+                         -> MachineLetter -> MWMPPlaythrough s -> MPerTilesState s -> MoveGen -> ST s MoveGen
+shadowStartPlaythroughST cfg ld board currentLetter mwp mpts gen = do
+  -- Traverse through all placed tiles
+  gen1 <- traversePlaythroughST ld board currentLetter mwp gen
+  -- Increment playthrough blocks in WMP state
+  case mgWMPStatic gen1 of
+    Just _ -> mwmpIncrementBlocks mwp
+    Nothing -> return ()
+  -- Continue with playthrough shadow
+  let isUnique = mgDir gen == Horizontal
+  playthroughShadowPlayLeftST cfg ld board isUnique mwp mpts gen1
+
+-- | Traverse through placed tiles going left, accumulating score - ST version
+traversePlaythroughST :: LetterDistribution -> Board -> MachineLetter
+                      -> MWMPPlaythrough s -> MoveGen -> ST s MoveGen
+traversePlaythroughST ld board ml mwp gen = do
+  let unblanked = unblankLetter ml
+      tileScore = ldScore ld unblanked
+      col = mgCurrentLeftCol gen
+      rowOrCol = mgCurrentRowIndex gen
+      dir = mgDir gen
+      lastAnchorCol = mgLastAnchorCol gen
+
+  -- Add playthrough letter to WMP state
+  case mgWMPStatic gen of
+    Just _ -> mwmpAddLetter unblanked mwp
+    Nothing -> return ()
+
+  let gen1 = gen { mgShadowMainwordRestrictedScore = mgShadowMainwordRestrictedScore gen + tileScore }
+
+  if col == 0 || col == lastAnchorCol + 1
+    then return gen1
+    else do
+      let newCol = col - 1
+          nextLetter = getLetterForDir board rowOrCol newCol dir
+      if unML nextLetter == 0
+        then return gen1 { mgCurrentLeftCol = col }  -- Hit empty, stay at current
+        else traversePlaythroughST ld board nextLetter mwp (gen1 { mgCurrentLeftCol = newCol })
+
+-- | Shadow play left from non-playthrough start - ST version
+nonplaythroughShadowPlayLeftST :: ShadowConfig -> LetterDistribution -> Board -> Bool
+                               -> MWMPPlaythrough s -> MPerTilesState s -> MoveGen -> ST s MoveGen
+nonplaythroughShadowPlayLeftST cfg ld board isUnique mwp mpts gen = do
+  -- First try extending right
+  let possibleRight = mgAnchorRightExtensionSet gen .&. mgRackCrossSet gen
+  gen1 <- if possibleRight /= 0
+          then shadowPlayRightST cfg ld board isUnique mwp mpts gen
+          else return gen
+  let gen2 = gen1 { mgAnchorRightExtensionSet = trivialCrossSet (mgLdSize gen) }
+
+      col = mgCurrentLeftCol gen2
+      rowOrCol = mgCurrentRowIndex gen2
+      dir = mgDir gen2
+      lastAnchorCol = mgLastAnchorCol gen2
+
+  if col == 0 || col == lastAnchorCol + 1 ||
+     mgTilesPlayed gen2 >= mgNumberOfLettersOnRack gen2
+    then return gen2
+    else do
+      -- Check if left square is occupied (playthrough)
+      let leftLetter = if col > 0 then getLetterForDir board rowOrCol (col - 1) dir else MachineLetter 0
+      if unML leftLetter /= 0
+        then do
+          -- Found playthrough tile, traverse through it
+          gen3 <- traverseLeftPlaythroughST ld board mwp gen2
+          -- Increment playthrough blocks in WMP state
+          case mgWMPStatic gen3 of
+            Just _ -> mwmpIncrementBlocks mwp
+            Nothing -> return ()
+          let gen4 = gen3 { mgAnchorLeftExtensionSet = trivialCrossSet (mgLdSize gen) }
+          nonplaythroughShadowPlayLeftST cfg ld board isUnique mwp mpts gen4
+        else do
+          -- Empty square, check if we can extend
+          let possibleLeft = mgAnchorLeftExtensionSet gen2 .&. mgRackCrossSet gen2
+          if possibleLeft == 0
+            then return gen2
+            else do
+              let (_, crossSet, crossScore, bonus, _, _) = getBoardData board rowOrCol (col - 1) dir
+                  possibleHere = possibleLeft .&. crossSet
+              if possibleHere == 0
+                then return gen2
+                else do
+                  let gen3 = gen2 { mgAnchorLeftExtensionSet = trivialCrossSet (mgLdSize gen2)
+                                  , mgCurrentLeftCol = col - 1
+                                  , mgTilesPlayed = mgTilesPlayed gen2 + 1
+                                  }
+                      letterMult = letterMultiplier bonus
+                      thisWordMult = wordMultiplier bonus
+
+                      (restricted, restrictedTileScore, gen4) = tryRestrictTile ld possibleHere letterMult gen3
+
+                      -- Compute perpendicular score contribution
+                      perpContrib = crossScore * thisWordMult +
+                                    (if restricted && crossScore > 0
+                                     then restrictedTileScore * letterMult * thisWordMult
+                                     else 0)
+
+                      gen5 = gen4 { mgShadowWordMultiplier = mgShadowWordMultiplier gen4 * thisWordMult
+                                  , mgShadowPerpAdditionalScore = mgShadowPerpAdditionalScore gen4 + perpContrib
+                                  }
+
+                      crossWordMult = if crossScore > 0 then letterMult * thisWordMult else 0
+                      gen6 = if not restricted
+                             then insertUnrestrictedMultipliers ld letterMult thisWordMult crossWordMult (col - 1) gen5
+                             else gen5
+
+                  gen7 <- shadowRecordST cfg mwp mpts gen6
+                  nonplaythroughShadowPlayLeftST cfg ld board isUnique mwp mpts gen7
+
+-- | Traverse through playthrough tiles going left - ST version
+traverseLeftPlaythroughST :: LetterDistribution -> Board -> MWMPPlaythrough s -> MoveGen -> ST s MoveGen
+traverseLeftPlaythroughST ld board mwp gen = do
+  let col = mgCurrentLeftCol gen
+      rowOrCol = mgCurrentRowIndex gen
+      dir = mgDir gen
+      lastAnchorCol = mgLastAnchorCol gen
+
+  if col == 0 || col == lastAnchorCol + 1
+    then return gen
+    else do
+      let leftCol = col - 1
+          leftLetter = getLetterForDir board rowOrCol leftCol dir
+      if unML leftLetter == 0
+        then return gen  -- Hit empty, stay at current
+        else do
+          let unblanked = unblankLetter leftLetter
+              tileScore = ldScore ld unblanked
+          -- Add playthrough letter to WMP state
+          case mgWMPStatic gen of
+            Just _ -> mwmpAddLetter unblanked mwp
+            Nothing -> return ()
+          let gen1 = gen { mgShadowMainwordRestrictedScore = mgShadowMainwordRestrictedScore gen + tileScore
+                         , mgCurrentLeftCol = leftCol
+                         }
+          traverseLeftPlaythroughST ld board mwp gen1
+
+-- | Shadow play left from playthrough start - ST version
+playthroughShadowPlayLeftST :: ShadowConfig -> LetterDistribution -> Board -> Bool
+                            -> MWMPPlaythrough s -> MPerTilesState s -> MoveGen -> ST s MoveGen
+playthroughShadowPlayLeftST cfg ld board isUnique mwp mpts gen = do
+  -- First try extending right
+  let possibleRight = mgAnchorRightExtensionSet gen .&. mgRackCrossSet gen
+  gen1 <- if possibleRight /= 0
+          then shadowPlayRightST cfg ld board isUnique mwp mpts gen
+          else return gen
+  let gen2 = gen1 { mgAnchorRightExtensionSet = trivialCrossSet (mgLdSize gen) }
+
+      col = mgCurrentLeftCol gen2
+      rowOrCol = mgCurrentRowIndex gen2
+      dir = mgDir gen2
+      lastAnchorCol = mgLastAnchorCol gen2
+
+  if col == 0 || col == lastAnchorCol + 1 ||
+     mgTilesPlayed gen2 >= mgNumberOfLettersOnRack gen2
+    then return gen2
+    else do
+      -- Check if left square is occupied (playthrough)
+      let leftLetter = if col > 0 then getLetterForDir board rowOrCol (col - 1) dir else MachineLetter 0
+      if unML leftLetter /= 0
+        then do
+          -- Found playthrough tile, traverse through it
+          gen3 <- traverseLeftPlaythroughST ld board mwp gen2
+          -- Increment playthrough blocks in WMP state
+          case mgWMPStatic gen3 of
+            Just _ -> mwmpIncrementBlocks mwp
+            Nothing -> return ()
+          let gen4 = gen3 { mgAnchorLeftExtensionSet = trivialCrossSet (mgLdSize gen) }
+          playthroughShadowPlayLeftST cfg ld board isUnique mwp mpts gen4
+        else do
+          -- Empty square, check if we can extend
+          let possibleLeft = mgAnchorLeftExtensionSet gen2 .&. mgRackCrossSet gen2
+          if possibleLeft == 0
+            then return gen2
+            else do
+              let (_, crossSet, crossScore, bonus, _, _) = getBoardData board rowOrCol (col - 1) dir
+                  possibleHere = possibleLeft .&. crossSet
+              if possibleHere == 0
+                then return gen2
+                else do
+                  let gen3 = gen2 { mgAnchorLeftExtensionSet = trivialCrossSet (mgLdSize gen2)
+                                  , mgCurrentLeftCol = col - 1
+                                  , mgTilesPlayed = mgTilesPlayed gen2 + 1
+                                  }
+                      letterMult = letterMultiplier bonus
+                      thisWordMult = wordMultiplier bonus
+
+                      (restricted, restrictedTileScore, gen4) = tryRestrictTile ld possibleHere letterMult gen3
+
+                      -- Compute perpendicular score contribution
+                      perpContrib = crossScore * thisWordMult +
+                                    (if restricted && crossScore > 0
+                                     then restrictedTileScore * letterMult * thisWordMult
+                                     else 0)
+
+                      gen5 = gen4
+                        { mgShadowPerpAdditionalScore = mgShadowPerpAdditionalScore gen4 + perpContrib
+                        , mgShadowWordMultiplier = mgShadowWordMultiplier gen4 * thisWordMult
+                        }
+
+                      crossWordMult = if crossScore > 0 then letterMult * thisWordMult else 0
+                      gen6 = if not restricted
+                             then insertUnrestrictedMultipliers ld letterMult thisWordMult crossWordMult (col - 1) gen5
+                             else gen5
+
+                      newUnique = if crossSet == trivialCrossSet (mgLdSize gen) then True else isUnique
+
+                  gen7 <- if playIsNonemptyAndNonduplicate (mgTilesPlayed gen6) newUnique
+                          then shadowRecordST cfg mwp mpts gen6
+                          else return gen6
+
+                  playthroughShadowPlayLeftST cfg ld board newUnique mwp mpts gen7
+
+-- | Shadow play to the right - ST version
+shadowPlayRightST :: ShadowConfig -> LetterDistribution -> Board -> Bool
+                  -> MWMPPlaythrough s -> MPerTilesState s -> MoveGen -> ST s MoveGen
+shadowPlayRightST cfg ld board isUnique mwp mpts gen0 = do
+  -- Save original state for restoration
+  let origMainScore = mgShadowMainwordRestrictedScore gen0
+      origPerpScore = mgShadowPerpAdditionalScore gen0
+      origWordMult = mgShadowWordMultiplier gen0
+      origRightCol = mgCurrentRightCol gen0
+      origTilesPlayed = mgTilesPlayed gen0
+      origDescScores = mgDescTileScores gen0
+      origRack = mgPlayerRack gen0
+      origRackCS = mgRackCrossSet gen0
+      origDescXWMuls = mgDescCrossWordMuls gen0
+      origDescEffMuls = mgDescEffLetterMuls gen0
+      origNumUnrestrMuls = mgNumUnrestrictedMuls gen0
+
+  -- Save WMP playthrough state before extending right
+  mwmpSave mwp
+
+  -- Extend right
+  (finalGen, _) <- extendRightST cfg ld board isUnique mwp mpts gen0
+
+  -- Restore WMP playthrough state
+  mwmpRestore mwp
+
+  -- Restore original state but keep highest scores
+  return finalGen
+    { mgShadowMainwordRestrictedScore = origMainScore
+    , mgShadowPerpAdditionalScore = origPerpScore
+    , mgShadowWordMultiplier = origWordMult
+    , mgCurrentRightCol = origRightCol
+    , mgTilesPlayed = origTilesPlayed
+    , mgDescTileScores = origDescScores
+    , mgPlayerRack = origRack
+    , mgRackCrossSet = origRackCS
+    , mgDescCrossWordMuls = origDescXWMuls
+    , mgDescEffLetterMuls = origDescEffMuls
+    , mgNumUnrestrictedMuls = origNumUnrestrMuls
+    }
+
+-- | Extend shadow to the right - ST version
+extendRightST :: ShadowConfig -> LetterDistribution -> Board -> Bool
+              -> MWMPPlaythrough s -> MPerTilesState s -> MoveGen -> ST s (MoveGen, Bool)
+extendRightST cfg ld board isUnique mwp mpts gen = do
+  let col = mgCurrentRightCol gen
+      rowOrCol = mgCurrentRowIndex gen
+      dir = mgDir gen
+
+  if col >= boardDim - 1 || mgTilesPlayed gen >= mgNumberOfLettersOnRack gen
+    then return (gen, isUnique)
+    else do
+      let newCol = col + 1
+          -- Check if next position is occupied (playthrough)
+          nextLetter = getLetterForDir board rowOrCol newCol dir
+      if unML nextLetter /= 0
+        then do
+          -- Occupied, traverse through playthrough tiles
+          (gen1, foundPlaythrough) <- traverseRightPlaythroughST ld board mwp
+                                        (gen { mgCurrentRightCol = col })  -- Start from current col
+          -- Increment playthrough blocks in WMP state if we found any
+          case mgWMPStatic gen1 of
+            Just _ | foundPlaythrough -> mwmpIncrementBlocks mwp
+            _ -> return ()
+          let gen2 = gen1 { mgAnchorRightExtensionSet = trivialCrossSet (mgLdSize gen) }
+          extendRightST cfg ld board isUnique mwp mpts gen2
+        else do
+          -- Empty square, try to place a tile
+          let (_, crossSet, crossScore, bonus, leftExt, _) = getBoardData board rowOrCol newCol dir
+              rackCS = mgRackCrossSet gen
+              rightExt = mgAnchorRightExtensionSet gen
+
+              -- Non-blank cross set and left extension
+              nonblankCS = crossSet .&. complement 1
+              nonblankLeftExt = leftExt .&. complement 1
+
+          if (nonblankCS .&. nonblankLeftExt) == 0
+            then return (gen, isUnique)
+            else do
+              let possibleHere = crossSet .&. rackCS .&. rightExt .&. leftExt
+              if possibleHere == 0
+                then return (gen, isUnique)
+                else do
+                  let gen1 = gen
+                        { mgCurrentRightCol = newCol
+                        , mgTilesPlayed = mgTilesPlayed gen + 1
+                        , mgAnchorRightExtensionSet = trivialCrossSet (mgLdSize gen)
+                        }
+
+                      letterMult = letterMultiplier bonus
+                      thisWordMult = wordMultiplier bonus
+
+                      (restricted, restrictedTileScore, gen2) = tryRestrictTile ld possibleHere letterMult gen1
+
+                      -- Compute perpendicular score contribution
+                      perpContrib = crossScore * thisWordMult +
+                                    (if restricted && crossScore > 0
+                                     then restrictedTileScore * letterMult * thisWordMult
+                                     else 0)
+
+                      gen3 = gen2
+                        { mgShadowPerpAdditionalScore = mgShadowPerpAdditionalScore gen2 + perpContrib
+                        , mgShadowWordMultiplier = mgShadowWordMultiplier gen2 * thisWordMult
+                        }
+
+                      crossWordMult = if crossScore > 0 then letterMult * thisWordMult else 0
+                      gen4 = if not restricted
+                             then insertUnrestrictedMultipliers ld letterMult thisWordMult crossWordMult newCol gen3
+                             else gen3
+
+                      newUnique = if crossSet == trivialCrossSet (mgLdSize gen) then True else isUnique
+
+                  -- Traverse through any playthrough tiles
+                  (gen5, foundPlaythrough2) <- traverseRightPlaythroughST ld board mwp gen4
+                  -- Increment playthrough blocks in WMP state if we found any
+                  case mgWMPStatic gen5 of
+                    Just _ | foundPlaythrough2 -> mwmpIncrementBlocks mwp
+                    _ -> return ()
+
+                  gen6 <- if playIsNonemptyAndNonduplicate (mgTilesPlayed gen5) newUnique
+                          then shadowRecordST cfg mwp mpts gen5
+                          else return gen5
+
+                  extendRightST cfg ld board newUnique mwp mpts gen6
+
+-- | Traverse through playthrough tiles to the right - ST version
+traverseRightPlaythroughST :: LetterDistribution -> Board -> MWMPPlaythrough s
+                           -> MoveGen -> ST s (MoveGen, Bool)
+traverseRightPlaythroughST ld board mwp gen = do
+  let col = mgCurrentRightCol gen
+      rowOrCol = mgCurrentRowIndex gen
+      dir = mgDir gen
+
+  if col + 1 >= boardDim
+    then return (gen, False)
+    else do
+      let nextLetter = getLetterForDir board rowOrCol (col + 1) dir
+      if unML nextLetter == 0
+        then return (gen, False)
+        else do
+          let unblanked = unblankLetter nextLetter
+              tileScore = ldScore ld unblanked
+          -- Add playthrough letter to WMP state
+          case mgWMPStatic gen of
+            Just _ -> mwmpAddLetter unblanked mwp
+            Nothing -> return ()
+          let gen1 = gen
+                { mgCurrentRightCol = col + 1
+                , mgShadowMainwordRestrictedScore = mgShadowMainwordRestrictedScore gen + tileScore
+                }
+          (gen2, _) <- traverseRightPlaythroughST ld board mwp gen1
+          return (gen2, True)
+
+-- | Record a shadow score - ST version
+-- Checks WMP word existence using mutable playthrough state.
+-- When bag is not empty and WMP is active, adds the best leave value for this
+-- number of tiles played to get a tighter equity bound.
+shadowRecordST :: ShadowConfig -> MWMPPlaythrough s -> MPerTilesState s -> MoveGen -> ST s MoveGen
+shadowRecordST cfg mwp mpts gen = do
+  let tilesPlayed = mgTilesPlayed gen
+      numLettersOnRack = mgNumberOfLettersOnRack gen
+      bagCount = shadowBagCount cfg
+
+  -- Check WMP existence if active
+  skipDueToWMP <- case mgWMPStatic gen of
+    Nothing -> return False
+    Just ws -> do
+      hasPlaythrough <- mwmpHasPlaythrough mwp
+      if hasPlaythrough && tilesPlayed == numLettersOnRack
+        then do
+          -- Check bingo with playthrough
+          exists <- mwmpCheckBingoExistence ws mwp
+          return (not exists)
+        else if not hasPlaythrough && tilesPlayed >= minimumWordLength
+          then return (not (wmpStaticWordOfLengthExists tilesPlayed ws))
+          else return False
+
+  if skipDueToWMP
+    then return gen  -- Skip recording, word doesn't exist
+    else do
+      let -- Compute score from unrestricted tiles with best multipliers
+          tilesPlayedScore = computeUnrestrictedTilesScore gen
+
+          -- Bingo bonus
+          bingoBonus = if tilesPlayed >= defaultRackSize
+                       then mgBingoBonus gen
+                       else 0
+
+          -- Total score
+          score = tilesPlayedScore +
+                  (mgShadowMainwordRestrictedScore gen * mgShadowWordMultiplier gen) +
+                  mgShadowPerpAdditionalScore gen + bingoBonus
+
+          -- WMP leave value: only add when bag is not empty (matches C MAGPIE)
+          -- The leave value is the best leave among all valid subracks
+          -- Note: Only use the leave value if it's been populated (not minBound)
+          -- If best leaves aren't populated, fall back to 0
+          leaveValue = case mgWMPStatic gen of
+            Just ws | bagCount > 0 ->
+              let lv = wmpStaticGetBestLeaveValue tilesPlayed ws
+              in if lv == Equity minBound then 0 else equityToInt lv
+            _ -> 0
+
+          -- Equity = score + leave value (converted to int)
+          equity = score + leaveValue
+
+          -- Update max tiles played
+          newMaxTiles = max (mgMaxTilesToPlay gen) tilesPlayed
+
+          -- Update highest scores (overall)
+          newHighScore = max (mgHighestShadowScore gen) score
+          newHighEquity = max (mgHighestShadowEquity gen) equity
+
+      -- Update per-tiles scores using mutable state (O(1) instead of O(n))
+      case mgWMPStatic gen of
+        Just _ -> updatePerTilesState mpts tilesPlayed score equity
+        Nothing -> return ()
+
+      return gen
+        { mgHighestShadowScore = newHighScore
+        , mgHighestShadowEquity = newHighEquity
+        , mgMaxTilesToPlay = newMaxTiles
+        }
