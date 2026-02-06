@@ -42,6 +42,7 @@ module Magpie.WMPMoveGen
   , mwmpCheckBingoExistence
   , mwmpGetPlaythroughBitRack
   , mwmpGetNumTilesPlayedThrough
+  , mwmpGetPlaythroughBlocks
 
     -- * Word existence checking
   , wmpMoveGenCheckNonplaythroughExistence
@@ -53,6 +54,7 @@ module Magpie.WMPMoveGen
 
     -- * Subrack iteration
   , wmpMoveGenPlaythroughSubracksInit
+  , wmpMoveGenSetPlaythroughFromBoard
   , wmpMoveGenGetNumSubrackCombinations
   , wmpMoveGenGetSubrackWords
   , wmpMoveGenGetWord
@@ -67,9 +69,10 @@ module Magpie.WMPMoveGen
   ) where
 
 import Magpie.BitRack
+import Magpie.Board (Board, getLetter)
 import Magpie.WMP
 import Magpie.Equity (Equity(..))
-import Magpie.Types (MachineLetter(..), Rack(..), rackCounts, rackTotal_)
+import Magpie.Types (MachineLetter(..), Rack(..), rackCounts, rackTotal_, unblankLetter)
 
 import Data.Bits (shiftL)
 import Data.Int (Int32)
@@ -244,9 +247,9 @@ wmpMoveGenCheckNonplaythroughExistence checkLeaves getLeaveValue wmg =
       hasWord <- VUM.replicate (rackSize + 1) False
       bestLeaves <- VUM.replicate (rackSize + 1) (Equity minBound)
 
-      -- Enumerate subracks recursively
+      -- Enumerate subracks recursively (cap fullRackSize at rackSize for safety)
       let playerBitRack = wmgPlayerBitRack wmg
-          fullRackSize = wmgFullRackSize wmg
+          fullRackSize = min (wmgFullRackSize wmg) rackSize
 
           -- No explicit type signature to avoid ST type variable issues
           enumerate !current !nextMl !count !leaveIdx = do
@@ -258,13 +261,15 @@ wmpMoveGenCheckNonplaythroughExistence checkLeaves getLeaveValue wmg =
 
             case findNext nextMl of
               Nothing -> do
-                -- Base case: record this subrack
-                let offset = getCombinationOffset count
-                cnt <- VUM.read countBySize count
-                let insertIdx = offset + cnt
-                let leaveVal = getLeaveValue leaveIdx
-                VM.write infosRef insertIdx (SubrackInfo current Nothing leaveVal)
-                VUM.write countBySize count (cnt + 1)
+                -- Base case: record this subrack (guard against out-of-bounds)
+                when (count <= fullRackSize) $ do
+                  let offset = getCombinationOffset count
+                  cnt <- VUM.read countBySize count
+                  let insertIdx = offset + cnt
+                  when (insertIdx < 128) $ do  -- Safety bound check
+                    let leaveVal = getLeaveValue leaveIdx
+                    VM.write infosRef insertIdx (SubrackInfo current Nothing leaveVal)
+                    VUM.write countBySize count (cnt + 1)
 
               Just ml -> do
                 let maxNum = bitRackGetLetterCount (MachineLetter (fromIntegral ml)) playerBitRack
@@ -279,12 +284,14 @@ wmpMoveGenCheckNonplaythroughExistence checkLeaves getLeaveValue wmg =
 
       enumerate emptyBitRack (0 :: Int) 0 ((1 `shiftL` fullRackSize) - 1)
 
-      -- Check word existence for each size
-      forM_ [minimumWordLength .. fullRackSize] $ \size -> do
+      -- Check word existence for each size (cap at rackSize for safety)
+      let maxSize = min fullRackSize rackSize
+      forM_ [minimumWordLength .. maxSize] $ \size -> when (size <= rackSize) $ do
         let offset = getCombinationOffset size
+            leaveSize = fullRackSize - size
         cnt <- VUM.read countBySize size
-        let leaveSize = fullRackSize - size
-        when checkLeaves $ VUM.write bestLeaves leaveSize (Equity minBound)
+        when (checkLeaves && leaveSize >= 0 && leaveSize <= rackSize) $
+          VUM.write bestLeaves leaveSize (Equity minBound)
 
         forM_ [0 .. cnt - 1] $ \idxForSize -> do
           let idx = offset + idxForSize
@@ -294,7 +301,7 @@ wmpMoveGenCheckNonplaythroughExistence checkLeaves getLeaveValue wmg =
 
           when (isJust entry) $ do
             VUM.write hasWord size True
-            when checkLeaves $ do
+            when (checkLeaves && leaveSize >= 0 && leaveSize <= rackSize) $ do
               bestVal <- VUM.read bestLeaves leaveSize
               when (siLeaveValue info > bestVal) $
                 VUM.write bestLeaves leaveSize (siLeaveValue info)
@@ -360,6 +367,40 @@ wmpMoveGenPlaythroughSubracksInit tilesToPlay wordLength wmg =
                  else si) (wmgNonplaythroughInfos wmg)
          in wmg' { wmgPlaythroughInfos = playInfos }
 
+-- | Set playthrough BitRack by scanning board tiles from rightmostStartCol
+-- Scans from rightmostStartCol and collects board letters until playthroughBlocks blocks are found
+-- A block is a contiguous sequence of non-empty squares
+wmpMoveGenSetPlaythroughFromBoard :: Board -> Int -> Int -> Int -> WMPMoveGen -> WMPMoveGen
+wmpMoveGenSetPlaythroughFromBoard board row rightmostCol playthroughBlocks wmg
+  | playthroughBlocks == 0 = wmpMoveGenResetPlaythrough wmg
+  | otherwise =
+      let (playthroughBR, numPlaythrough) = scanForPlaythrough board row rightmostCol playthroughBlocks
+      in wmg
+           { wmgPlaythroughBitRack = playthroughBR
+           , wmgNumTilesPlayedThrough = numPlaythrough
+           , wmgPlaythroughBlocks = playthroughBlocks
+           }
+  where
+    scanForPlaythrough :: Board -> Int -> Int -> Int -> (BitRack, Int)
+    scanForPlaythrough b r startCol numBlocks = go emptyBitRack 0 startCol False 0
+      where
+        boardDim = 15  -- Standard board dimension
+        go !br !count !col !inBlock !blocksFound
+          | col >= boardDim = (br, count)
+          | blocksFound == numBlocks && not inBlock = (br, count)
+          | otherwise =
+              let letter = getLetter b r col
+                  mlVal = unML letter
+              in if mlVal == 0
+                   then -- Empty square
+                     if inBlock
+                       then go br count (col + 1) False (blocksFound + 1)  -- Exiting a block
+                       else go br count (col + 1) False blocksFound
+                   else -- Non-empty square - add to playthrough
+                     let unblanked = unblankLetter letter
+                         br' = bitRackAddLetter unblanked br
+                     in go br' (count + 1) (col + 1) True (if inBlock then blocksFound else blocksFound)
+
 -- | Get number of subrack combinations for current tiles to play
 wmpMoveGenGetNumSubrackCombinations :: WMPMoveGen -> Int
 wmpMoveGenGetNumSubrackCombinations wmg =
@@ -416,12 +457,14 @@ wmpMoveGenComputeBestLeavesWithKLV getLeaveValue originalRack wmg =
     Just _ -> runST $ do
       bestLeaves <- VUM.replicate (rackSize + 1) (Equity minBound)
 
-      let fullRackSize = wmgFullRackSize wmg
+      -- Cap fullRackSize at rackSize for safety
+      let fullRackSize = min (wmgFullRackSize wmg) rackSize
           playerBitRack = wmgPlayerBitRack wmg
           distSize = VU.length (rackCounts originalRack)
 
-      -- Iterate through each word size
-      forM_ [minimumWordLength .. fullRackSize] $ \wordSize -> do
+      -- Iterate through each word size (cap at rackSize for safety)
+      let maxWordSize = min fullRackSize rackSize
+      forM_ [minimumWordLength .. maxWordSize] $ \wordSize -> when (wordSize <= rackSize) $ do
         let offset = getCombinationOffset wordSize
             count = wmgCountBySize wmg VU.! wordSize
             leaveSize = fullRackSize - wordSize
@@ -431,7 +474,7 @@ wmpMoveGenComputeBestLeavesWithKLV getLeaveValue originalRack wmg =
               info = wmgNonplaythroughInfos wmg V.! idx
 
           -- Only process subracks that form valid words
-          when (isJust (siWMPEntry info)) $ do
+          when (isJust (siWMPEntry info) && leaveSize >= 0 && leaveSize <= rackSize) $ do
             -- Compute the leave (rack - subrack)
             let subrack = siSubrack info
                 leaveRack = bitRackSubtract playerBitRack subrack distSize originalRack
@@ -501,8 +544,9 @@ wmpStaticWordOfLengthExists len ws
 wmpStaticGetBestLeaveValue :: Int -> WMPStatic -> Equity
 wmpStaticGetBestLeaveValue tilesPlayed ws =
   let leaveSize = wsFullRackSize ws - tilesPlayed
-  in if leaveSize < 0 || leaveSize > rackSize
-     then 0
+      vecLen = VU.length (wsNonplaythroughBestLeaves ws)
+  in if leaveSize < 0 || leaveSize >= vecLen
+     then Equity 0
      else wsNonplaythroughBestLeaves ws VU.! leaveSize
 
 -- ============================================================================
@@ -602,6 +646,10 @@ mwmpGetPlaythroughBitRack mwp = do
 -- | Get number of tiles played through
 mwmpGetNumTilesPlayedThrough :: MWMPPlaythrough s -> ST s Int
 mwmpGetNumTilesPlayedThrough mwp = readSTRef (mwpNumTilesPlayedThrough mwp)
+
+-- | Get number of playthrough blocks
+mwmpGetPlaythroughBlocks :: MWMPPlaythrough s -> ST s Int
+mwmpGetPlaythroughBlocks mwp = readSTRef (mwpPlaythroughBlocks mwp)
 
 -- | Check if full rack bingo exists with current playthrough tiles
 mwmpCheckBingoExistence :: WMPStatic -> MWMPPlaythrough s -> ST s Bool

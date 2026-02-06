@@ -22,13 +22,13 @@ module Magpie.Shadow
   , extractSortedAnchors
   ) where
 
-import Magpie.Types
+import Magpie.Types hiding (rackSize, boardDim)
 import Magpie.KWG
 import Magpie.Board (Board, computeAnchors, computeCrossSets, getCrossSet, getCrossScore,
                      getSquare, getLetter, isEmpty, isAnchor, getTilesPlayed,
                      trivialCrossSet, getLeftExtensionSet, getRightExtensionSet)
 import Magpie.LetterDistribution
-import Magpie.WMPMoveGen
+import Magpie.WMPMoveGen hiding (rackSize)
 import Magpie.Equity (Equity(..), equityToInt)
 
 import Data.Word (Word64)
@@ -57,10 +57,131 @@ newMPerTilesState = do
 -- | Update per-tiles state with a new score/equity for given tiles_played
 updatePerTilesState :: MPerTilesState s -> Int -> Int -> Int -> ST s ()
 updatePerTilesState mpts tilesPlayed score equity = do
-  currentScore <- MVU.read (mptsScores mpts) tilesPlayed
-  when (score > currentScore) $ do
-    MVU.write (mptsScores mpts) tilesPlayed score
-    MVU.write (mptsEquities mpts) tilesPlayed equity
+  -- Bounds check: tilesPlayed must be 0-7
+  when (tilesPlayed >= 0 && tilesPlayed < 8) $ do
+    currentScore <- MVU.read (mptsScores mpts) tilesPlayed
+    when (score > currentScore) $ do
+      MVU.write (mptsScores mpts) tilesPlayed score
+      MVU.write (mptsEquities mpts) tilesPlayed equity
+
+-- ============================================================================
+-- Mutable WMP Anchor Accumulator
+-- ============================================================================
+-- Tracks anchor bounds during shadow traversal for WMP move generation.
+-- Indexed by (playthroughBlocks * 8 + tilesPlayed).
+-- MAX_POSSIBLE_PLAYTHROUGH_BLOCKS = 8, RACK_SIZE = 7, so 8 * 8 = 64 entries.
+
+-- | Constants for anchor accumulator
+rackSize :: Int
+rackSize = 7
+
+boardDim :: Int
+boardDim = 15
+
+maxPlaythroughBlocks :: Int
+maxPlaythroughBlocks = 8  -- (BOARD_DIM / 2) + 1
+
+maxWMPAnchors :: Int
+maxWMPAnchors = maxPlaythroughBlocks * (rackSize + 1)  -- 64
+
+-- | Index into anchor array for (playthroughBlocks, tilesPlayed)
+wmpAnchorIndex :: Int -> Int -> Int
+wmpAnchorIndex playthroughBlocks tilesPlayed =
+  playthroughBlocks * (rackSize + 1) + tilesPlayed
+
+-- | Mutable WMP anchor accumulator
+-- Each entry stores: (tilesPlayed, playthroughBlocks, wordLength,
+--                     leftmostStartCol, rightmostStartCol, highestScore, highestEquity)
+-- We use separate vectors for each field for cache efficiency.
+data MWMPAnchorAccum s = MWMPAnchorAccum
+  { mwaTilesPlayed       :: !(MVU.MVector s Int)
+  , mwaPlaythroughBlocks :: !(MVU.MVector s Int)
+  , mwaWordLength        :: !(MVU.MVector s Int)
+  , mwaLeftmostCol       :: !(MVU.MVector s Int)
+  , mwaRightmostCol      :: !(MVU.MVector s Int)
+  , mwaHighestScore      :: !(MVU.MVector s Int)
+  , mwaHighestEquity     :: !(MVU.MVector s Int)
+  }
+
+-- | Create new mutable WMP anchor accumulator initialized to empty state
+newMWMPAnchorAccum :: ST s (MWMPAnchorAccum s)
+newMWMPAnchorAccum = do
+  tilesPlayed <- MVU.replicate maxWMPAnchors 0
+  playthroughBlocks <- MVU.replicate maxWMPAnchors 0
+  wordLength <- MVU.replicate maxWMPAnchors 0
+  leftmostCol <- MVU.replicate maxWMPAnchors (boardDim - 1)  -- Start at rightmost
+  rightmostCol <- MVU.replicate maxWMPAnchors 0              -- Start at leftmost
+  highestScore <- MVU.replicate maxWMPAnchors minBound
+  highestEquity <- MVU.replicate maxWMPAnchors minBound
+  return $ MWMPAnchorAccum tilesPlayed playthroughBlocks wordLength
+                          leftmostCol rightmostCol highestScore highestEquity
+
+-- | Reset the anchor accumulator (call before each anchor position)
+resetMWMPAnchorAccum :: MWMPAnchorAccum s -> ST s ()
+resetMWMPAnchorAccum mwa = do
+  MVU.set (mwaTilesPlayed mwa) 0
+  MVU.set (mwaPlaythroughBlocks mwa) 0
+  MVU.set (mwaWordLength mwa) 0
+  MVU.set (mwaLeftmostCol mwa) (boardDim - 1)
+  MVU.set (mwaRightmostCol mwa) 0
+  MVU.set (mwaHighestScore mwa) minBound
+  MVU.set (mwaHighestEquity mwa) minBound
+
+-- | Update anchor accumulator with a new observation
+-- This is the equivalent of C's wmp_move_gen_maybe_update_anchor
+wmpMaybeUpdateAnchor :: MWMPAnchorAccum s -> Int -> Int -> Int -> Int -> Int -> Int -> ST s ()
+wmpMaybeUpdateAnchor mwa playthroughBlocks tilesPlayed wordLen startCol score equity = do
+  let idx = wmpAnchorIndex playthroughBlocks tilesPlayed
+  -- Always update tiles/blocks/wordLength
+  MVU.write (mwaTilesPlayed mwa) idx tilesPlayed
+  MVU.write (mwaPlaythroughBlocks mwa) idx playthroughBlocks
+  MVU.write (mwaWordLength mwa) idx wordLen
+  -- Update leftmost (min)
+  currentLeft <- MVU.read (mwaLeftmostCol mwa) idx
+  when (startCol < currentLeft) $
+    MVU.write (mwaLeftmostCol mwa) idx startCol
+  -- Update rightmost (max)
+  currentRight <- MVU.read (mwaRightmostCol mwa) idx
+  when (startCol > currentRight) $
+    MVU.write (mwaRightmostCol mwa) idx startCol
+  -- Update highest score
+  currentScore <- MVU.read (mwaHighestScore mwa) idx
+  when (score > currentScore) $
+    MVU.write (mwaHighestScore mwa) idx score
+  -- Update highest equity
+  currentEquity <- MVU.read (mwaHighestEquity mwa) idx
+  when (equity > currentEquity) $
+    MVU.write (mwaHighestEquity mwa) idx equity
+
+-- | Extract accumulated anchors as a list
+-- Only returns anchors where tilesPlayed > 0
+extractWMPAnchors :: MWMPAnchorAccum s -> Int -> Int -> Int -> Direction -> ST s [Anchor]
+extractWMPAnchors mwa row col lastAnchorCol dir = do
+  let indices = [0 .. maxWMPAnchors - 1]
+  anchors <- mapM (extractAnchorAt mwa row col lastAnchorCol dir) indices
+  return $ filter (\a -> anchorTilesToPlay a > 0) anchors
+  where
+    extractAnchorAt acc r c lac d idx = do
+      tp <- MVU.read (mwaTilesPlayed acc) idx
+      pb <- MVU.read (mwaPlaythroughBlocks acc) idx
+      wl <- MVU.read (mwaWordLength acc) idx
+      lc <- MVU.read (mwaLeftmostCol acc) idx
+      rc <- MVU.read (mwaRightmostCol acc) idx
+      hs <- MVU.read (mwaHighestScore acc) idx
+      he <- MVU.read (mwaHighestEquity acc) idx
+      return Anchor
+        { anchorRow = r
+        , anchorCol = c
+        , anchorLastAnchorCol = lac
+        , anchorDir = d
+        , anchorHighestPossibleScore = hs
+        , anchorHighestPossibleEquity = he
+        , anchorTilesToPlay = tp
+        , anchorPlaythroughBlocks = pb
+        , anchorWordLength = wl
+        , anchorLeftmostStartCol = lc
+        , anchorRightmostStartCol = rc
+        }
 
 -- | An anchor represents a position where moves can start, with upper bound info
 data Anchor = Anchor
@@ -367,30 +488,30 @@ shadowPlayForAnchor cfg ld board rack dir wmg rowOrCol col lastAnchorCol =
 
        in if wmpActive
           then
-            -- WMP mode: create per-tiles mutable state, freeze at end
-            let (gen3, scoreVec, equityVec) = runST $ do
+            -- WMP mode: create per-tiles mutable state and anchor accumulator
+            let (gen3, scoreVec, equityVec, wmpAnchors) = runST $ do
                   mwp <- newMWMPPlaythrough
                   mpts <- newMPerTilesState
+                  maa <- newMWMPAnchorAccum
                   gen <- if unML currentLetter == 0
-                         then shadowStartNonplaythroughST cfg ld board mwp mpts gen2
-                         else shadowStartPlaythroughST cfg ld board currentLetter mwp mpts gen2
+                         then shadowStartNonplaythroughST cfg ld board mwp mpts (Just maa) gen2
+                         else shadowStartPlaythroughST cfg ld board currentLetter mwp mpts (Just maa) gen2
                   scores <- VU.freeze (mptsScores mpts)
                   equities <- VU.freeze (mptsEquities mpts)
-                  return (gen, scores, equities)
-            in case mgWMPStatic gen3 of
-                 Just ws
-                   | shadowMultiAnchor cfg ->
-                     -- Multi-anchor mode: one anchor per word length (for WMP move generation)
-                     [ makeAnchor n score equity
-                     | n <- [minimumWordLength .. rackTotal rack]
-                     , let score = scoreVec VU.! n
-                     , score > minBound
-                     , wmpStaticWordOfLengthExists n ws || n == rackTotal rack
-                     , let equity = equityVec VU.! n
-                     ]
-                   | otherwise ->
-                     -- Single-anchor mode: use max score from any word length (for GADDAG move generation)
-                     -- Still use WMP for existence checking
+                  anchors <- extractWMPAnchors maa actualRow actualCol lastAnchorCol dir
+                  return (gen, scores, equities, anchors)
+            in if shadowMultiAnchor cfg
+               then
+                 -- Multi-anchor mode: use WMP anchor accumulator for proper start column bounds
+                 -- Filter to only include anchors where words of that length exist
+                 case mgWMPStatic gen3 of
+                   Just ws -> filter (\a -> wmpStaticWordOfLengthExists (anchorWordLength a) ws
+                                         || anchorTilesToPlay a == rackTotal rack) wmpAnchors
+                   Nothing -> wmpAnchors
+               else
+                 -- Single-anchor mode: use max score from any word length (for GADDAG move generation)
+                 case mgWMPStatic gen3 of
+                   Just ws ->
                      let validLengths = [n | n <- [minimumWordLength .. rackTotal rack]
                                           , wmpStaticWordOfLengthExists n ws || n == rackTotal rack
                                           , scoreVec VU.! n > minBound]
@@ -400,15 +521,15 @@ shadowPlayForAnchor cfg ld board rack dir wmg rowOrCol col lastAnchorCol =
                                     maxScore = maximum [scoreVec VU.! n | n <- validLengths]
                                     maxEquity = maximum [equityVec VU.! n | n <- validLengths]
                                 in [makeAnchor maxTiles maxScore maxEquity]
-                 Nothing -> []
+                   Nothing -> []
           else
             -- Non-WMP mode: no per-tiles tracking needed, just use max values
             let gen3 = runST $ do
                   mwp <- newMWMPPlaythrough
                   mpts <- newMPerTilesState  -- Dummy, won't be updated
                   if unML currentLetter == 0
-                    then shadowStartNonplaythroughST cfg ld board mwp mpts gen2
-                    else shadowStartPlaythroughST cfg ld board currentLetter mwp mpts gen2
+                    then shadowStartNonplaythroughST cfg ld board mwp mpts Nothing gen2
+                    else shadowStartPlaythroughST cfg ld board currentLetter mwp mpts Nothing gen2
                 maxTiles = mgMaxTilesToPlay gen3
             in if maxTiles == 0
                then []
@@ -527,8 +648,9 @@ extractSortedAnchors = sortBy (comparing (Down . anchorHighestPossibleEquity))
 
 -- | Start shadow from empty anchor square (non-playthrough) - ST version
 shadowStartNonplaythroughST :: ShadowConfig -> LetterDistribution -> Board
-                            -> MWMPPlaythrough s -> MPerTilesState s -> MoveGen -> ST s MoveGen
-shadowStartNonplaythroughST cfg ld board mwp mpts gen = do
+                            -> MWMPPlaythrough s -> MPerTilesState s
+                            -> Maybe (MWMPAnchorAccum s) -> MoveGen -> ST s MoveGen
+shadowStartNonplaythroughST cfg ld board mwp mpts maa gen = do
   let col = mgCurrentLeftCol gen
       rowOrCol = mgCurrentRowIndex gen
       dir = mgDir gen
@@ -567,7 +689,7 @@ shadowStartNonplaythroughST cfg ld board mwp mpts gen = do
             }
 
       -- Record single tile play (for both directions)
-      gen4 <- shadowRecordST cfg mwp mpts gen3
+      gen4 <- shadowRecordST cfg mwp mpts maa gen3
 
       let -- Set word multiplier to actual value
           gen5 = gen4 { mgShadowWordMultiplier = thisWordMult }
@@ -578,12 +700,13 @@ shadowStartNonplaythroughST cfg ld board mwp mpts gen = do
           -- Continue left
           isUnique = dir == Horizontal
 
-      nonplaythroughShadowPlayLeftST cfg ld board isUnique mwp mpts gen6
+      nonplaythroughShadowPlayLeftST cfg ld board isUnique mwp mpts maa gen6
 
 -- | Start shadow from occupied anchor square (playthrough) - ST version
 shadowStartPlaythroughST :: ShadowConfig -> LetterDistribution -> Board
-                         -> MachineLetter -> MWMPPlaythrough s -> MPerTilesState s -> MoveGen -> ST s MoveGen
-shadowStartPlaythroughST cfg ld board currentLetter mwp mpts gen = do
+                         -> MachineLetter -> MWMPPlaythrough s -> MPerTilesState s
+                         -> Maybe (MWMPAnchorAccum s) -> MoveGen -> ST s MoveGen
+shadowStartPlaythroughST cfg ld board currentLetter mwp mpts maa gen = do
   -- Traverse through all placed tiles
   gen1 <- traversePlaythroughST ld board currentLetter mwp gen
   -- Increment playthrough blocks in WMP state
@@ -592,7 +715,7 @@ shadowStartPlaythroughST cfg ld board currentLetter mwp mpts gen = do
     Nothing -> return ()
   -- Continue with playthrough shadow
   let isUnique = mgDir gen == Horizontal
-  playthroughShadowPlayLeftST cfg ld board isUnique mwp mpts gen1
+  playthroughShadowPlayLeftST cfg ld board isUnique mwp mpts maa gen1
 
 -- | Traverse through placed tiles going left, accumulating score - ST version
 traversePlaythroughST :: LetterDistribution -> Board -> MachineLetter
@@ -623,12 +746,13 @@ traversePlaythroughST ld board ml mwp gen = do
 
 -- | Shadow play left from non-playthrough start - ST version
 nonplaythroughShadowPlayLeftST :: ShadowConfig -> LetterDistribution -> Board -> Bool
-                               -> MWMPPlaythrough s -> MPerTilesState s -> MoveGen -> ST s MoveGen
-nonplaythroughShadowPlayLeftST cfg ld board isUnique mwp mpts gen = do
+                               -> MWMPPlaythrough s -> MPerTilesState s
+                               -> Maybe (MWMPAnchorAccum s) -> MoveGen -> ST s MoveGen
+nonplaythroughShadowPlayLeftST cfg ld board isUnique mwp mpts maa gen = do
   -- First try extending right
   let possibleRight = mgAnchorRightExtensionSet gen .&. mgRackCrossSet gen
   gen1 <- if possibleRight /= 0
-          then shadowPlayRightST cfg ld board isUnique mwp mpts gen
+          then shadowPlayRightST cfg ld board isUnique mwp mpts maa gen
           else return gen
   let gen2 = gen1 { mgAnchorRightExtensionSet = trivialCrossSet (mgLdSize gen) }
 
@@ -652,7 +776,7 @@ nonplaythroughShadowPlayLeftST cfg ld board isUnique mwp mpts gen = do
             Just _ -> mwmpIncrementBlocks mwp
             Nothing -> return ()
           let gen4 = gen3 { mgAnchorLeftExtensionSet = trivialCrossSet (mgLdSize gen) }
-          nonplaythroughShadowPlayLeftST cfg ld board isUnique mwp mpts gen4
+          nonplaythroughShadowPlayLeftST cfg ld board isUnique mwp mpts maa gen4
         else do
           -- Empty square, check if we can extend
           let possibleLeft = mgAnchorLeftExtensionSet gen2 .&. mgRackCrossSet gen2
@@ -688,8 +812,8 @@ nonplaythroughShadowPlayLeftST cfg ld board isUnique mwp mpts gen = do
                              then insertUnrestrictedMultipliers ld letterMult thisWordMult crossWordMult (col - 1) gen5
                              else gen5
 
-                  gen7 <- shadowRecordST cfg mwp mpts gen6
-                  nonplaythroughShadowPlayLeftST cfg ld board isUnique mwp mpts gen7
+                  gen7 <- shadowRecordST cfg mwp mpts maa gen6
+                  nonplaythroughShadowPlayLeftST cfg ld board isUnique mwp mpts maa gen7
 
 -- | Traverse through playthrough tiles going left - ST version
 traverseLeftPlaythroughST :: LetterDistribution -> Board -> MWMPPlaythrough s -> MoveGen -> ST s MoveGen
@@ -720,12 +844,13 @@ traverseLeftPlaythroughST ld board mwp gen = do
 
 -- | Shadow play left from playthrough start - ST version
 playthroughShadowPlayLeftST :: ShadowConfig -> LetterDistribution -> Board -> Bool
-                            -> MWMPPlaythrough s -> MPerTilesState s -> MoveGen -> ST s MoveGen
-playthroughShadowPlayLeftST cfg ld board isUnique mwp mpts gen = do
+                            -> MWMPPlaythrough s -> MPerTilesState s
+                            -> Maybe (MWMPAnchorAccum s) -> MoveGen -> ST s MoveGen
+playthroughShadowPlayLeftST cfg ld board isUnique mwp mpts maa gen = do
   -- First try extending right
   let possibleRight = mgAnchorRightExtensionSet gen .&. mgRackCrossSet gen
   gen1 <- if possibleRight /= 0
-          then shadowPlayRightST cfg ld board isUnique mwp mpts gen
+          then shadowPlayRightST cfg ld board isUnique mwp mpts maa gen
           else return gen
   let gen2 = gen1 { mgAnchorRightExtensionSet = trivialCrossSet (mgLdSize gen) }
 
@@ -749,7 +874,7 @@ playthroughShadowPlayLeftST cfg ld board isUnique mwp mpts gen = do
             Just _ -> mwmpIncrementBlocks mwp
             Nothing -> return ()
           let gen4 = gen3 { mgAnchorLeftExtensionSet = trivialCrossSet (mgLdSize gen) }
-          playthroughShadowPlayLeftST cfg ld board isUnique mwp mpts gen4
+          playthroughShadowPlayLeftST cfg ld board isUnique mwp mpts maa gen4
         else do
           -- Empty square, check if we can extend
           let possibleLeft = mgAnchorLeftExtensionSet gen2 .&. mgRackCrossSet gen2
@@ -789,15 +914,16 @@ playthroughShadowPlayLeftST cfg ld board isUnique mwp mpts gen = do
                       newUnique = if crossSet == trivialCrossSet (mgLdSize gen) then True else isUnique
 
                   gen7 <- if playIsNonemptyAndNonduplicate (mgTilesPlayed gen6) newUnique
-                          then shadowRecordST cfg mwp mpts gen6
+                          then shadowRecordST cfg mwp mpts maa gen6
                           else return gen6
 
-                  playthroughShadowPlayLeftST cfg ld board newUnique mwp mpts gen7
+                  playthroughShadowPlayLeftST cfg ld board newUnique mwp mpts maa gen7
 
 -- | Shadow play to the right - ST version
 shadowPlayRightST :: ShadowConfig -> LetterDistribution -> Board -> Bool
-                  -> MWMPPlaythrough s -> MPerTilesState s -> MoveGen -> ST s MoveGen
-shadowPlayRightST cfg ld board isUnique mwp mpts gen0 = do
+                  -> MWMPPlaythrough s -> MPerTilesState s
+                  -> Maybe (MWMPAnchorAccum s) -> MoveGen -> ST s MoveGen
+shadowPlayRightST cfg ld board isUnique mwp mpts maa gen0 = do
   -- Save original state for restoration
   let origMainScore = mgShadowMainwordRestrictedScore gen0
       origPerpScore = mgShadowPerpAdditionalScore gen0
@@ -815,7 +941,7 @@ shadowPlayRightST cfg ld board isUnique mwp mpts gen0 = do
   mwmpSave mwp
 
   -- Extend right
-  (finalGen, _) <- extendRightST cfg ld board isUnique mwp mpts gen0
+  (finalGen, _) <- extendRightST cfg ld board isUnique mwp mpts maa gen0
 
   -- Restore WMP playthrough state
   mwmpRestore mwp
@@ -837,8 +963,9 @@ shadowPlayRightST cfg ld board isUnique mwp mpts gen0 = do
 
 -- | Extend shadow to the right - ST version
 extendRightST :: ShadowConfig -> LetterDistribution -> Board -> Bool
-              -> MWMPPlaythrough s -> MPerTilesState s -> MoveGen -> ST s (MoveGen, Bool)
-extendRightST cfg ld board isUnique mwp mpts gen = do
+              -> MWMPPlaythrough s -> MPerTilesState s
+              -> Maybe (MWMPAnchorAccum s) -> MoveGen -> ST s (MoveGen, Bool)
+extendRightST cfg ld board isUnique mwp mpts maa gen = do
   let col = mgCurrentRightCol gen
       rowOrCol = mgCurrentRowIndex gen
       dir = mgDir gen
@@ -859,7 +986,7 @@ extendRightST cfg ld board isUnique mwp mpts gen = do
             Just _ | foundPlaythrough -> mwmpIncrementBlocks mwp
             _ -> return ()
           let gen2 = gen1 { mgAnchorRightExtensionSet = trivialCrossSet (mgLdSize gen) }
-          extendRightST cfg ld board isUnique mwp mpts gen2
+          extendRightST cfg ld board isUnique mwp mpts maa gen2
         else do
           -- Empty square, try to place a tile
           let (_, crossSet, crossScore, bonus, leftExt, _) = getBoardData board rowOrCol newCol dir
@@ -914,10 +1041,10 @@ extendRightST cfg ld board isUnique mwp mpts gen = do
                     _ -> return ()
 
                   gen6 <- if playIsNonemptyAndNonduplicate (mgTilesPlayed gen5) newUnique
-                          then shadowRecordST cfg mwp mpts gen5
+                          then shadowRecordST cfg mwp mpts maa gen5
                           else return gen5
 
-                  extendRightST cfg ld board newUnique mwp mpts gen6
+                  extendRightST cfg ld board newUnique mwp mpts maa gen6
 
 -- | Traverse through playthrough tiles to the right - ST version
 traverseRightPlaythroughST :: LetterDistribution -> Board -> MWMPPlaythrough s
@@ -951,8 +1078,10 @@ traverseRightPlaythroughST ld board mwp gen = do
 -- Checks WMP word existence using mutable playthrough state.
 -- When bag is not empty and WMP is active, adds the best leave value for this
 -- number of tiles played to get a tighter equity bound.
-shadowRecordST :: ShadowConfig -> MWMPPlaythrough s -> MPerTilesState s -> MoveGen -> ST s MoveGen
-shadowRecordST cfg mwp mpts gen = do
+-- Also updates WMP anchor accumulator with start column bounds.
+shadowRecordST :: ShadowConfig -> MWMPPlaythrough s -> MPerTilesState s
+               -> Maybe (MWMPAnchorAccum s) -> MoveGen -> ST s MoveGen
+shadowRecordST cfg mwp mpts mAnchorAccum gen = do
   let tilesPlayed = mgTilesPlayed gen
       numLettersOnRack = mgNumberOfLettersOnRack gen
       bagCount = shadowBagCount cfg
@@ -1011,6 +1140,18 @@ shadowRecordST cfg mwp mpts gen = do
       case mgWMPStatic gen of
         Just _ -> updatePerTilesState mpts tilesPlayed score equity
         Nothing -> return ()
+
+      -- Update WMP anchor accumulator with start column bounds
+      case (mgWMPStatic gen, mAnchorAccum) of
+        (Just _, Just anchorAccum) -> do
+          numPlaythrough <- mwmpGetNumTilesPlayedThrough mwp
+          playthroughBlocks <- mwmpGetPlaythroughBlocks mwp
+          let wordLen = tilesPlayed + numPlaythrough
+              startCol = mgCurrentLeftCol gen
+          when (wordLen >= minimumWordLength) $
+            wmpMaybeUpdateAnchor anchorAccum playthroughBlocks tilesPlayed
+                                 wordLen startCol score equity
+        _ -> return ()
 
       return gen
         { mgHighestShadowScore = newHighScore

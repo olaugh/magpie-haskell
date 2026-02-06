@@ -993,42 +993,46 @@ recursiveGenBestSTDir cfg mKlv origRack maxLeaveVal kwg ld board rackM rackCross
 -- WMP-based move generation (replaces GADDAG for WMP anchors)
 -- ============================================================================
 
--- | WMP-based move generation for a single anchor (nonplaythrough only)
+-- | WMP-based move generation for a single anchor
 -- Uses WMP word lookup instead of GADDAG traversal
--- For now, only handles nonplaythrough (empty board) case
+-- Iterates from leftmostStartCol to rightmostStartCol for each word
 wordmapGenST :: MoveGenConfig -> Maybe KLV -> WMPMoveGen -> Rack -> Int32 -> LetterDistribution -> Board
              -> Direction -> Int -> Anchor -> BestMoveRef s -> ST s ()
 wordmapGenST cfg mKlv wmg origRack _maxLeaveVal ld board dir genRow anchor bestRef = do
   let tilesToPlay = anchorTilesToPlay anchor
       wordLength = anchorWordLength anchor
-      startCol = anchorCol anchor  -- For empty board, word starts at anchor column
       playthroughBlocks = anchorPlaythroughBlocks anchor
+      leftmostCol = anchorLeftmostStartCol anchor
+      rightmostCol = anchorRightmostStartCol anchor
 
-  -- Only handle nonplaythrough case for now
-  when (playthroughBlocks == 0) $ do
-    case wmgWMP wmg of
-      Nothing -> return ()
-      Just _wmp -> do
-        -- Initialize subracks for this anchor
-        let wmg' = wmpMoveGenPlaythroughSubracksInit tilesToPlay wordLength wmg
-            numCombinations = wmpMoveGenGetNumSubrackCombinations wmg'
+  -- Only handle nonplaythrough case for now (empty board)
+  when (playthroughBlocks == 0) $ case wmgWMP wmg of
+    Nothing -> return ()
+    Just _wmp -> do
+      -- Set playthrough BitRack from board (scanning from rightmostCol)
+      let wmg1 = wmpMoveGenSetPlaythroughFromBoard board genRow rightmostCol playthroughBlocks wmg
+          -- Initialize subracks for this anchor
+          wmg2 = wmpMoveGenPlaythroughSubracksInit tilesToPlay wordLength wmg1
+          numCombinations = wmpMoveGenGetNumSubrackCombinations wmg2
 
-        -- Safety: skip if numCombinations is 0 or very large
-        when (numCombinations > 0 && numCombinations <= 128) $ do
-          -- Iterate through subrack combinations
-          forM_ [0 .. numCombinations - 1] $ \subrackIdx -> do
-            -- Get words for this subrack
-            let (_wmg'', wordList) = wmpMoveGenGetSubrackWords subrackIdx wmg'
-                leaveVal = wmpMoveGenGetLeaveValue subrackIdx wmg'
+      -- Safety: skip if numCombinations is 0 or very large
+      when (numCombinations > 0 && numCombinations <= 128) $ do
+        -- Iterate through subrack combinations
+        forM_ [0 .. numCombinations - 1] $ \subrackIdx -> do
+          -- Get words for this subrack
+          let (_wmg3, wordList) = wmpMoveGenGetSubrackWords subrackIdx wmg2
+              leaveVal = wmpMoveGenGetLeaveValue subrackIdx wmg2
 
-            -- Check pruning early
-            (_, Equity bestEquity) <- readSTRef bestRef
-            let maxScoreForAnchor = anchorHighestPossibleScore anchor
-                maxPossibleEquity = fromIntegral maxScoreForAnchor * 1000 + fromIntegral (equityToInt32 leaveVal)
+          -- Check pruning early
+          (_, Equity bestEquity) <- readSTRef bestRef
+          let maxScoreForAnchor = anchorHighestPossibleScore anchor
+              maxPossibleEquity = fromIntegral maxScoreForAnchor * 1000 + fromIntegral (equityToInt32 leaveVal)
 
-            when (maxPossibleEquity > bestEquity && not (null wordList)) $ do
-              -- Iterate through words
-              forM_ wordList $ \word -> do
+          when (maxPossibleEquity > bestEquity && not (null wordList)) $ do
+            -- Iterate through words
+            forM_ wordList $ \word -> do
+              -- Iterate from leftmostCol to rightmostCol
+              forM_ [leftmostCol .. rightmostCol] $ \startCol -> do
                 -- Check if the word is valid at this position (cross-sets)
                 let checkResult = checkPlaythroughAndCrosses ld board genRow startCol word
                 case checkResult of
